@@ -49,6 +49,13 @@ local MUL_MIN, MUL_STEP, MUL_T_MAX, MUL_F_MAX = 25, 25, 200, 400
 
 local FLAME_DEFAULT = 1  -- orange
 local ACCENT_DEFAULT = 11  -- mint
+local FLAME_PALETTE = {
+	{ 1.0, 0.75, 0.3,  1.0, 0.25, 0.1 },
+	{ 0.6, 0.85, 1.0,  0.2, 0.4, 1.0 },
+	{ 0.7, 1.0, 0.5,   0.1, 0.8, 0.3 },
+	{ 0.85, 0.65, 1.0, 0.5, 0.15, 0.9 },
+	{ 1.0, 0.7, 0.85,  0.95, 0.2, 0.5 },
+}
 
 
 -- shared helpers ------------------------------------------------------
@@ -207,7 +214,7 @@ local SHARE = {
 -- per-player stores, keyed by player id
 local R = {}
 for _, name in ipairs({
-	"allowed", "binds", "boostBinds", "fuel", "ramp", "baseY", "groundedFor",
+	"allowed", "binds", "boostBinds", "flames", "fuel", "ramp", "baseY", "groundedFor",
 	"ovT", "ovF", "boostCdT", "boostLeft", "boostPrev",
 	"stats", "airborne", "lastX", "lastZ",
 }) do
@@ -262,6 +269,18 @@ local function publishMuls()
 		end
 	end
 	shared.pm = list
+end
+
+local function publishFlames()
+	local list = {}
+	for _, p in ipairs(GetAllPlayers()) do
+		local flame = R.flames[p]
+		if flame and flame ~= FLAME_DEFAULT then
+			list[#list + 1] = p
+			list[#list + 1] = flame
+		end
+	end
+	shared.pf = list
 end
 
 local function statKey(p)
@@ -321,6 +340,7 @@ local function forgetLeftPlayers()
 	end
 	publishAllowed()
 	publishMuls()
+	publishFlames()
 end
 
 local function canFly(p)
@@ -448,7 +468,7 @@ function server.init()
 
 	for field, key in pairs(SHARE) do shared[key] = S[field] end
 	shared.fuelIds, shared.fuelVals, shared.allowed = {}, {}, {}
-	shared.jetting, shared.boosting, shared.pm, shared.ps = {}, {}, {}, {}
+	shared.jetting, shared.boosting, shared.pm, shared.ps, shared.pf = {}, {}, {}, {}, {}
 	shared.noteSeq = 0
 	shared.noteText = ""
 end
@@ -581,12 +601,17 @@ function server.resetAll()
 	notify("Host reset all Jetpack settings")
 end
 
-function server.setPlayerBind(pid, bind, boostBind)
+function server.setPlayerBind(pid, bind, boostBind, flame)
 	if not validPlayer(pid) then return end
 	bind = normalizeBind(bind)
 	if bind then R.binds[pid] = bind end
 	boostBind = normalizeBind(boostBind)
 	if boostBind then R.boostBinds[pid] = boostBind end
+	flame = floor(num(flame, FLAME_DEFAULT))
+	if FLAME_PALETTE[flame] then
+		R.flames[pid] = flame
+		publishFlames()
+	end
 end
 
 local function checkPlayers()
@@ -939,6 +964,14 @@ local function fuelMultipliers(pid)
 	return ovFuel / 100 * (1 + upBonus(UPGRADES[1], time, on)), 1 + upBonus(UPGRADES[3], time, on)
 end
 
+local function playerFlame(pid)
+	if pid == GetLocalPlayer() then return K.flame end
+	local list = shared.pf
+	local i = listIndex(list, 2, pid)
+	if i then return list[i + 1] end
+	return FLAME_DEFAULT
+end
+
 local function listHas(list, pid)
 	if type(list) ~= "table" then return false end
 	for i = 1, #list do
@@ -970,7 +1003,7 @@ end
 
 local function sendBind(pad)
 	K.bindTimer = 0
-	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb)
+	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb, K.flame)
 end
 
 local function bindLabel(name)
@@ -992,13 +1025,6 @@ local ACCENT_PALETTE = {
 	{ 1.0, 0.82, 0.18 }, { 0.35, 0.70, 0.95 }, { 0.45, 0.85, 0.55 }, { 0.95, 0.50, 0.75 },
 	{ 1.0, 0.55, 0.20 }, { 0.92, 0.32, 0.32 }, { 0.68, 0.50, 0.95 }, { 0.30, 0.82, 0.78 },
 	{ 0.72, 0.90, 0.25 }, { 0.92, 0.92, 0.92 }, { 0.40, 0.90, 0.68 },  -- 11 mint (default)
-}
-local FLAME_PALETTE = {
-	{ 1.0, 0.75, 0.3,  1.0, 0.25, 0.1 },
-	{ 0.6, 0.85, 1.0,  0.2, 0.4, 1.0 },
-	{ 0.7, 1.0, 0.5,   0.1, 0.8, 0.3 },
-	{ 0.85, 0.65, 1.0, 0.5, 0.15, 0.9 },
-	{ 1.0, 0.7, 0.85,  0.95, 0.2, 0.5 },
 }
 local FLAME_KEYS = { "flame_orange", "flame_blue", "flame_green", "flame_purple", "flame_pink" }
 local GAUGE_KEYS = { "gc_accent", "gc_cb", "gc_green", "gc_cyan", "gc_white" }
@@ -1044,7 +1070,10 @@ local function setSpeedHud(on) setFlag("speedHud", "savegame.mod.speedhud", on, 
 local function setAltHud(on) setFlag("altHud", "savegame.mod.alt_hud", on, false) K.altGroundY = nil end
 local function setRememberTab(on) setFlag("remember", "savegame.mod.tab_forget", on, true) end
 local function setSpeedUnit(v) setInt("speedUnit", "savegame.mod.speed_unit", SPEED_FACTOR[v] and v or 1) end
-local function setFlame(i) setInt("flame", "savegame.mod.flame", FLAME_PALETTE[i] and i or FLAME_DEFAULT) end
+local function setFlame(i)
+	setInt("flame", "savegame.mod.flame", FLAME_PALETTE[i] and i or FLAME_DEFAULT)
+	sendBind(usingPad())
+end
 local function setGaugeSize(v) setInt("gaugeSize", "savegame.mod.gauge_size", v) end
 local function setGaugePos(v) setInt("gaugePos", "savegame.mod.gauge_pos", v) end
 local function setFxMode(mode) K.fx = mode % 3 SetInt("savegame.mod.fxmode", K.fx + 1) end
@@ -1117,7 +1146,7 @@ local function spawnExhaust(player, mode, boosted)
 	local t = GetPlayerTransform(player)
 	local origin = TransformToParentPoint(t, Vec(0, 0.85, 0.3))
 	local carry = VecScale(GetPlayerVelocity(player), 0.5)
-	local f = FLAME_PALETTE[K.flame] or FLAME_PALETTE[FLAME_DEFAULT]
+	local f = FLAME_PALETTE[playerFlame(player)] or FLAME_PALETTE[FLAME_DEFAULT]
 	local down = boosted and -6 or -3.5
 
 	for _ = 1, boosted and 5 or 2 do
