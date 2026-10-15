@@ -8,20 +8,19 @@
 -- Saved settings live under savegame.mod.* and keep their names between
 -- versions so nobody loses their setup on update.
 --
--- 28.4: stability rewrite.
---   * Flight modes (Classic / Hover / Glide) removed. Hover assist stays.
---   * All server and client state now lives in a few tables. The old script
---     used too many local variables inside one function (Lua allows 60),
---     which could stop the script loading and made every toggle say the
---     server function was not recognized.
---   * Server calls are wrapped so a bad call can never crash the menu.
---   * Fuel tab simplified, single player gets its own wording and
---     hides host-only options.
---   * More colours: 10 accent colours, 5 flame colours, 5 gauge colours.
---   * Every setting from 28.3 is still here and keeps its saved name.
+-- 28.5: cleanup.
+--   * Server setters are generated from small tables instead of copy-pasted.
+--   * Settings rows return clicks instead of taking callbacks, so the menu no
+--     longer creates dozens of closures every frame.
+--   * Per-frame work trimmed (cached tab lists, no string building in T()).
+--   * The default accent colour (menu and HUD) is now Mint. Saved accent
+--     choices from older versions are kept as they were. Flame colours are
+--     unchanged.
 
-local VERSION = "28.4"
+local VERSION = "28.5"
 local REVISION = 1
+
+local floor, min, max, sqrt = math.floor, math.min, math.max, math.sqrt
 
 local THRUST_BASE = 0.3
 local SOUND_VOLUME = 0.5
@@ -43,7 +42,13 @@ local BIND_RESEND = 3
 local GAUGE_HIDE_DELAY = 3
 local GAUGE_FADE_RATE = 6
 
+local BOOST_TIME, BOOST_MUL = 0.4, 2.6
+local BOOST_CD_MIN, BOOST_CD_MAX, BOOST_CD_DEFAULT = 3, 30, 8
+local BOOST_COST_MAX, BOOST_COST_STEP, BOOST_COST_DEFAULT = 5, 0.5, 1.5
 local MUL_MIN, MUL_STEP, MUL_T_MAX, MUL_F_MAX = 25, 25, 200, 400
+
+local FLAME_DEFAULT = 1  -- orange
+local ACCENT_DEFAULT = 11  -- mint
 
 
 -- shared helpers ------------------------------------------------------
@@ -54,28 +59,26 @@ local function num(v, default)
 	return v
 end
 
-local function snap(v, step) return math.floor(v / step + 0.5) * step end
-local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function round(v) return floor(v + 0.5) end
+local function snap(v, step) return floor(v / step + 0.5) * step end
+local function clamp(v, lo, hi) return max(lo, min(hi, v)) end
+
+-- value snapped to a step and limited, or 0 meaning "off"
+local function clampOff(v, step, lo, hi)
+	v = num(v, 0)
+	if v <= 0 then return 0 end
+	return clamp(snap(v, step), lo, hi)
+end
 
 local function clampThrust(v) return clamp(snap(num(v, THRUST_DEFAULT), 10), 50, 150) end
-local function clampFuel(v) return clamp(math.floor(num(v, FUEL_DEFAULT) + 0.5), FUEL_MIN, FUEL_MAX) end
-
-local function clampCap(v)
-	v = num(v, 0)
-	if v <= 0 then return 0 end
-	return clamp(snap(v, CAP_STEP), CAP_MIN, CAP_MAX)
-end
-
+local function clampFuel(v) return clamp(round(num(v, FUEL_DEFAULT)), FUEL_MIN, FUEL_MAX) end
+local function clampCap(v) return clampOff(v, CAP_STEP, CAP_MIN, CAP_MAX) end
+local function clampCeiling(v) return clampOff(v, CEIL_STEP, CEIL_MIN, CEIL_MAX) end
 local function clampRefill(v) return clamp(snap(num(v, REFILL_DEFAULT), REFILL_STEP), REFILL_MIN, REFILL_MAX) end
 local function clampDelay(v) return clamp(snap(num(v, DELAY_DEFAULT), DELAY_STEP), DELAY_MIN, DELAY_MAX) end
-
-local function clampCeiling(v)
-	v = num(v, 0)
-	if v <= 0 then return 0 end
-	return clamp(snap(v, CEIL_STEP), CEIL_MIN, CEIL_MAX)
-end
-
 local function clampMul(v, hi) return clamp(snap(num(v, 100), MUL_STEP), MUL_MIN, hi) end
+local function clampBoostCd(v) return clamp(round(num(v, BOOST_CD_DEFAULT)), BOOST_CD_MIN, BOOST_CD_MAX) end
+local function clampBoostCost(v) return clamp(snap(num(v, BOOST_COST_DEFAULT), BOOST_COST_STEP), 0, BOOST_COST_MAX) end
 
 local PROFILES = {
 	original = { thrust = 100, cap = 0,  smooth = true,  fuel = false, tank = FUEL_DEFAULT },
@@ -88,32 +91,35 @@ local PROFILE_NAMES = {
 }
 
 local function sameList(a, b)
-	if #a ~= #b then return false end
-	for i = 1, #a do
+	local n = #a
+	if n ~= #b then return false end
+	for i = 1, n do
 		if a[i] ~= b[i] then return false end
 	end
 	return true
 end
 
+local function groundProbe(p)
+	if not IsPlayerValid(p) then return false end
+	local pos = GetPlayerTransform(p).pos
+	local hit, dist = QueryRaycast(Vec(pos[1], pos[2] + 0.25, pos[3]), Vec(0, -1, 0), 0.4)
+	return hit and dist <= 0.4
+end
+
 local function isGrounded(p)
-	local ok, result = pcall(function()
-		if not IsPlayerValid(p) then return false end
-		local pos = GetPlayerTransform(p).pos
-		local hit, dist = QueryRaycast(Vec(pos[1], pos[2] + 0.25, pos[3]), Vec(0, -1, 0), 0.4)
-		return hit and dist <= 0.4
-	end)
+	local ok, result = pcall(groundProbe, p)
 	return ok and result == true
 end
 
 local function rampPower(held)
-	local s = math.min(1, held / RAMP_SECONDS)
+	local s = min(1, held / RAMP_SECONDS)
 	return RAMP_FLOOR + (1 - RAMP_FLOOR) * s * s * (3 - 2 * s)
 end
 
 local function capSpeed(oldVel, newVel, cap)
 	if cap <= 0 then return newVel end
 	local newSpeed = VecLength(newVel)
-	local limit = math.max(cap, VecLength(oldVel))
+	local limit = max(cap, VecLength(oldVel))
 	if newSpeed <= limit or newSpeed == 0 then return newVel end
 	return VecScale(newVel, limit / newSpeed)
 end
@@ -127,7 +133,7 @@ for _, name in ipairs({
 }) do
 	VALID_INPUTS[name] = true
 end
-for c = string.byte("a"), string.byte("z") do VALID_INPUTS[string.char(c)] = true end
+for c = 97, 122 do VALID_INPUTS[string.char(c)] = true end
 for d = 0, 9 do VALID_INPUTS[tostring(d)] = true end
 for f = 1, 12 do VALID_INPUTS["f" .. f] = true end
 
@@ -136,8 +142,7 @@ local LEGACY_INPUTS = { sprint = "shift" }
 local function normalizeBind(bind)
 	if type(bind) ~= "string" then return nil end
 	bind = LEGACY_INPUTS[bind] or bind
-	if VALID_INPUTS[bind] then return bind end
-	return nil
+	return VALID_INPUTS[bind] and bind or nil
 end
 
 local function inputHeld(name, player)
@@ -179,22 +184,37 @@ end
 
 do  -- server scope
 
--- Everything the server remembers sits in two tables (S settings, R per-player).
 local S = {
 	on = true, thrust = THRUST_DEFAULT, cap = 0, smooth = true,
 	restrict = false, fuelOn = false, tank = FUEL_DEFAULT, refill = REFILL_DEFAULT,
 	delay = DELAY_DEFAULT, ceiling = 0, hostFree = false,
-	hover = true,
+	hover = true, boostOn = false, boostCd = BOOST_CD_DEFAULT, boostCost = BOOST_COST_DEFAULT,
 	upgrades = false, menuHidden = false, announce = true,
 	noteSeq = 0, playerCount = 0, errorShown = false,
 	fuelTimer = 0, statsTimer = 0, saveTimer = 0,
-	lastJetting = {}, lastFuelValues = {}, lastStats = {},
+	lastJetting = {}, lastBoosting = {}, lastFuelValues = {}, lastStats = {},
 }
-local R = {
-	allowed = {}, binds = {}, fuel = {}, ramp = {}, baseY = {}, groundedFor = {},
-	ovT = {}, ovF = {},
-	stats = {}, airborne = {}, lastX = {}, lastZ = {},
+
+-- which shared key mirrors each setting in S
+local SHARE = {
+	on = "enabled", thrust = "thrustPct", cap = "speedCap", smooth = "smooth",
+	fuelOn = "fuelEnabled", tank = "fuelCap", refill = "refill", delay = "refillDelay",
+	ceiling = "ceiling", hostFree = "hostFree", hover = "hover", boostOn = "boostOn",
+	boostCd = "boostCd", boostCost = "boostCost", upgrades = "upgrades",
+	menuHidden = "menuHidden", announce = "announce", restrict = "restrict",
 }
+
+-- per-player stores, keyed by player id
+local R = {}
+for _, name in ipairs({
+	"allowed", "binds", "boostBinds", "fuel", "ramp", "baseY", "groundedFor",
+	"ovT", "ovF", "boostCdT", "boostLeft", "boostPrev",
+	"stats", "airborne", "lastX", "lastZ",
+}) do
+	R[name] = {}
+end
+
+local function validPlayer(pid) return type(pid) == "number" and IsPlayerValid(pid) end
 
 local function notify(text, force)
 	if not S.announce and not force then return end
@@ -222,7 +242,7 @@ local function publishFuel(force)
 	for i = 1, #players do
 		local p = players[i]
 		ids[i] = p
-		values[i] = math.floor((R.fuel[p] or S.tank) * 10 + 0.5) / 10
+		values[i] = round((R.fuel[p] or S.tank) * 10) / 10
 	end
 	if force or not sameList(values, S.lastFuelValues) or #ids ~= #(shared.fuelIds or {}) then
 		shared.fuelIds = ids
@@ -259,7 +279,7 @@ local function statsFor(p)
 	s = {
 		key = key, dirty = false,
 		peak = GetInt(key .. ".peak"), dist = GetInt(key .. ".dist"),
-		time = GetInt(key .. ".time"),
+		time = GetInt(key .. ".time"), boosts = GetInt(key .. ".boosts"),
 	}
 	R.stats[p] = s
 	return s
@@ -268,21 +288,20 @@ end
 local function saveStat(s)
 	if not s or not s.dirty then return end
 	s.dirty = false
-	SetInt(s.key .. ".peak", math.floor(s.peak))
-	SetInt(s.key .. ".dist", math.floor(s.dist))
-	SetInt(s.key .. ".time", math.floor(s.time))
+	SetInt(s.key .. ".peak", floor(s.peak))
+	SetInt(s.key .. ".dist", floor(s.dist))
+	SetInt(s.key .. ".time", floor(s.time))
+	SetInt(s.key .. ".boosts", s.boosts)
 end
 
 local function publishStats(force)
-	local list = {}
+	local list, n = {}, 0
 	for _, p in ipairs(GetAllPlayers()) do
 		local s = R.stats[p]
 		if s then
-			local i = #list
-			list[i + 1] = p
-			list[i + 2] = math.floor(s.peak)
-			list[i + 3] = math.floor(s.dist)
-			list[i + 4] = math.floor(s.time)
+			list[n + 1], list[n + 2], list[n + 3], list[n + 4], list[n + 5] =
+				p, floor(s.peak), floor(s.dist), floor(s.time), s.boosts
+			n = n + 5
 		end
 	end
 	if force or not sameList(list, S.lastStats) then
@@ -306,18 +325,84 @@ end
 
 local function canFly(p)
 	if not S.on then return false end
-	if S.restrict and not IsPlayerHost(p) and not R.allowed[p] then return false end
-	return true
+	return not (S.restrict and not IsPlayerHost(p) and not R.allowed[p])
 end
 
 local function publishCustom(slot)
 	local p = PROFILES["custom" .. slot]
-	if not p then
-		shared["custom" .. slot] = {}
-		return
-	end
-	shared["custom" .. slot] = { p.thrust, p.cap, p.smooth and 1 or 0, p.fuel and 1 or 0, p.tank }
+	shared["custom" .. slot] = p and { p.thrust, p.cap, p.smooth and 1 or 0, p.fuel and 1 or 0, p.tank } or {}
 end
+
+-- setting setters ------------------------------------------------------
+-- Everything below is called from the host's settings screen. The server
+-- clamps every value itself, whatever the client sent.
+
+-- number setting: clamp, keep in S, mirror to shared, save (scaled to an int if needed)
+local function defNum(fname, field, saveKey, clampFn, scale, after)
+	local shareKey = SHARE[field]
+	server[fname] = function(v)
+		v = clampFn(v)
+		S[field] = v
+		shared[shareKey] = v
+		SetInt(saveKey, scale and round(v * scale) or v)
+		if after then after(v) end
+	end
+end
+
+-- on/off setting. inv = the saved flag means "off" (e.g. savegame.mod.disabled).
+local function defBool(fname, field, saveKey, inv, after)
+	local shareKey = SHARE[field]
+	server[fname] = function(on, silent)
+		on = on and true or false
+		S[field] = on
+		shared[shareKey] = on
+		if saveKey then SetInt(saveKey, (on ~= inv) and 1 or 0) end
+		if after then after(on, silent) end
+	end
+end
+
+defNum("setThrustPct", "thrust", "savegame.mod.thrustpct", clampThrust)
+defNum("setSpeedCap", "cap", "savegame.mod.speedcap", clampCap)
+defNum("setRefill", "refill", "savegame.mod.refill_x10", clampRefill, 10)
+defNum("setRefillDelay", "delay", "savegame.mod.refill_delay_x10", clampDelay, 10)
+defNum("setCeiling", "ceiling", "savegame.mod.ceiling", clampCeiling)
+defNum("setBoostCd", "boostCd", "savegame.mod.boost_cd", clampBoostCd)
+defNum("setBoostCost", "boostCost", "savegame.mod.boost_cost_x10", clampBoostCost, 10,
+	function() SetInt("savegame.mod.boost_cost_set", 1) end)
+defNum("setFuelCap", "tank", "savegame.mod.fuel_cap", clampFuel, nil, function(v)
+	for pid, amount in pairs(R.fuel) do
+		if amount > v then R.fuel[pid] = v end
+	end
+end)
+
+defBool("setEnabled", "on", "savegame.mod.disabled", true)
+defBool("setSmooth", "smooth", "savegame.mod.noramp", true)
+defBool("setHover", "hover", "savegame.mod.hover_off", true)
+defBool("setHostFree", "hostFree")
+defBool("setRestrict", "restrict", nil, false, publishAllowed)
+defBool("setBoostOn", "boostOn", "savegame.mod.boost_on", false, function(on)
+	notify(on and "Host turned boost on" or "Host turned boost off")
+end)
+defBool("setUpgrades", "upgrades", "savegame.mod.upgrades_on", false, function(on)
+	notify(on and "Host turned upgrades on" or "Host turned upgrades off")
+end)
+defBool("setMenuHidden", "menuHidden", "savegame.mod.menu_hidden", false, function(on, silent)
+	if silent ~= true then
+		notify(on and "Host hid the Jetpack settings menu" or "Host showed the Jetpack settings menu", true)
+	end
+end)
+defBool("setAnnounce", "announce", "savegame.mod.quiet", true, function(on, silent)
+	if silent ~= true then
+		notify(on and "Host turned settings messages on" or "Host turned settings messages off", true)
+	end
+end)
+defBool("setFuelEnabled", "fuelOn", "savegame.mod.fuel_enabled", false, function(on)
+	R.fuel = {}
+	S.lastFuelValues = {}
+	shared.fuelIds = {}
+	shared.fuelVals = {}
+	if on then publishFuel(true) end
+end)
 
 function server.init()
 	S.menuHidden = GetInt("savegame.mod.menu_hidden") == 1
@@ -326,20 +411,25 @@ function server.init()
 	S.smooth = GetInt("savegame.mod.noramp") ~= 1
 	S.cap = clampCap(GetInt("savegame.mod.speedcap"))
 
-	local savedThrust = GetInt("savegame.mod.thrustpct")
-	if savedThrust > 0 then S.thrust = clampThrust(savedThrust) end
+	local v = GetInt("savegame.mod.thrustpct")
+	if v > 0 then S.thrust = clampThrust(v) end
 
 	S.fuelOn = GetInt("savegame.mod.fuel_enabled") == 1
-	local savedTank = GetInt("savegame.mod.fuel_cap")
-	S.tank = savedTank > 0 and clampFuel(savedTank) or FUEL_DEFAULT
+	v = GetInt("savegame.mod.fuel_cap")
+	S.tank = v > 0 and clampFuel(v) or FUEL_DEFAULT
 
-	local savedRefill = GetInt("savegame.mod.refill_x10")
-	if savedRefill > 0 then S.refill = clampRefill(savedRefill / 10) end
+	v = GetInt("savegame.mod.refill_x10")
+	if v > 0 then S.refill = clampRefill(v / 10) end
 
 	S.delay = clampDelay(GetInt("savegame.mod.refill_delay_x10") / 10)
 	S.ceiling = clampCeiling(GetInt("savegame.mod.ceiling"))
 
 	S.hover = GetInt("savegame.mod.hover_off") ~= 1
+	S.boostOn = GetInt("savegame.mod.boost_on") == 1
+	v = GetInt("savegame.mod.boost_cd")
+	if v > 0 then S.boostCd = clampBoostCd(v) end
+	v = GetInt("savegame.mod.boost_cost_x10")
+	if v > 0 or GetInt("savegame.mod.boost_cost_set") == 1 then S.boostCost = clampBoostCost(v / 10) end
 	S.upgrades = GetInt("savegame.mod.upgrades_on") == 1
 
 	for slot = 1, 2 do
@@ -356,103 +446,15 @@ function server.init()
 		publishCustom(slot)
 	end
 
-	shared.thrustPct = S.thrust
-	shared.enabled = S.on
-	shared.menuHidden = S.menuHidden
-	shared.announce = S.announce
-	shared.speedCap = S.cap
-	shared.smooth = S.smooth
-	shared.fuelEnabled = S.fuelOn
-	shared.fuelCap = S.tank
-	shared.refill = S.refill
-	shared.refillDelay = S.delay
-	shared.ceiling = S.ceiling
-	shared.hostFree = false
-	shared.fuelIds = {}
-	shared.fuelVals = {}
-	shared.restrict = false
-	shared.allowed = {}
-	shared.jetting = {}
-	shared.hover = S.hover
-	shared.upgrades = S.upgrades
-	shared.pm = {}
-	shared.ps = {}
+	for field, key in pairs(SHARE) do shared[key] = S[field] end
+	shared.fuelIds, shared.fuelVals, shared.allowed = {}, {}, {}
+	shared.jetting, shared.boosting, shared.pm, shared.ps = {}, {}, {}, {}
 	shared.noteSeq = 0
 	shared.noteText = ""
 end
 
--- Everything below is called from the host's settings screen. The server
--- clamps every value itself, whatever the client sent.
-
-function server.setThrustPct(pct)
-	S.thrust = clampThrust(pct)
-	shared.thrustPct = S.thrust
-	SetInt("savegame.mod.thrustpct", S.thrust)
-end
-
-function server.setEnabled(on)
-	S.on = on and true or false
-	shared.enabled = S.on
-	SetInt("savegame.mod.disabled", S.on and 0 or 1)
-end
-
-function server.setMenuHidden(on, silent)
-	S.menuHidden = on and true or false
-	shared.menuHidden = S.menuHidden
-	SetInt("savegame.mod.menu_hidden", S.menuHidden and 1 or 0)
-	if silent ~= true then
-		notify(S.menuHidden and "Host hid the Jetpack settings menu" or "Host showed the Jetpack settings menu", true)
-	end
-end
-
-function server.setAnnounce(on, silent)
-	if not on and silent ~= true then notify("Host turned settings messages off", true) end
-	S.announce = on and true or false
-	shared.announce = S.announce
-	SetInt("savegame.mod.quiet", S.announce and 0 or 1)
-	if S.announce and silent ~= true then notify("Host turned settings messages on") end
-end
-
-function server.setSpeedCap(cap)
-	S.cap = clampCap(cap)
-	shared.speedCap = S.cap
-	SetInt("savegame.mod.speedcap", S.cap)
-end
-
-function server.setSmooth(on)
-	S.smooth = on and true or false
-	shared.smooth = S.smooth
-	SetInt("savegame.mod.noramp", S.smooth and 0 or 1)
-end
-
-function server.setFuelEnabled(on)
-	S.fuelOn = on and true or false
-	shared.fuelEnabled = S.fuelOn
-	SetInt("savegame.mod.fuel_enabled", S.fuelOn and 1 or 0)
-	R.fuel = {}
-	S.lastFuelValues = {}
-	shared.fuelIds = {}
-	shared.fuelVals = {}
-	if S.fuelOn then publishFuel(true) end
-end
-
-function server.setFuelCap(cap)
-	S.tank = clampFuel(cap)
-	shared.fuelCap = S.tank
-	SetInt("savegame.mod.fuel_cap", S.tank)
-	for pid, amount in pairs(R.fuel) do
-		if amount > S.tank then R.fuel[pid] = S.tank end
-	end
-end
-
-function server.setRestrict(on)
-	S.restrict = on and true or false
-	shared.restrict = S.restrict
-	publishAllowed()
-end
-
 function server.setAllowed(pid, on)
-	if type(pid) ~= "number" or not IsPlayerValid(pid) then return end
+	if not validPlayer(pid) then return end
 	R.allowed[pid] = on and true or nil
 	publishAllowed()
 end
@@ -464,29 +466,6 @@ function server.setAllowedAll(on)
 	publishAllowed()
 end
 
-function server.setRefill(seconds)
-	S.refill = clampRefill(seconds)
-	shared.refill = S.refill
-	SetInt("savegame.mod.refill_x10", math.floor(S.refill * 10 + 0.5))
-end
-
-function server.setRefillDelay(seconds)
-	S.delay = clampDelay(seconds)
-	shared.refillDelay = S.delay
-	SetInt("savegame.mod.refill_delay_x10", math.floor(S.delay * 10 + 0.5))
-end
-
-function server.setCeiling(metres)
-	S.ceiling = clampCeiling(metres)
-	shared.ceiling = S.ceiling
-	SetInt("savegame.mod.ceiling", S.ceiling)
-end
-
-function server.setHostFree(on)
-	S.hostFree = on and true or false
-	shared.hostFree = S.hostFree
-end
-
 function server.refillAll()
 	if not S.fuelOn then return end
 	for _, p in ipairs(GetAllPlayers()) do R.fuel[p] = S.tank end
@@ -494,17 +473,18 @@ function server.refillAll()
 end
 
 function server.refillPlayer(pid)
-	if not S.fuelOn or type(pid) ~= "number" or not IsPlayerValid(pid) then return end
+	if not S.fuelOn or not validPlayer(pid) then return end
 	R.fuel[pid] = S.tank
 	publishFuel(true)
 end
 
 function server.setPlayerFlight(pid, on)
-	if type(pid) ~= "number" or not IsPlayerValid(pid) or IsPlayerHost(pid) then return end
+	if not validPlayer(pid) or IsPlayerHost(pid) then return end
 	if on then
 		R.allowed[pid] = true
 	else
 		if not S.restrict then
+			-- blocking one player turns approval mode on and keeps everyone else allowed
 			for _, p in ipairs(GetAllPlayers()) do
 				if not IsPlayerHost(p) then R.allowed[p] = true end
 			end
@@ -531,7 +511,7 @@ end
 function server.resetStats()
 	for _, p in ipairs(GetAllPlayers()) do
 		local s = statsFor(p)
-		s.peak, s.dist, s.time = 0, 0, 0
+		s.peak, s.dist, s.time, s.boosts = 0, 0, 0, 0
 		s.dirty = true
 		saveStat(s)
 	end
@@ -539,21 +519,8 @@ function server.resetStats()
 	notify("Host reset flight stats")
 end
 
-function server.setHover(on)
-	S.hover = on and true or false
-	shared.hover = S.hover
-	SetInt("savegame.mod.hover_off", S.hover and 0 or 1)
-end
-
-function server.setUpgrades(on)
-	S.upgrades = on and true or false
-	shared.upgrades = S.upgrades
-	SetInt("savegame.mod.upgrades_on", S.upgrades and 1 or 0)
-	notify(S.upgrades and "Host turned upgrades on" or "Host turned upgrades off")
-end
-
 function server.setPlayerMul(pid, kind, pct)
-	if type(pid) ~= "number" or not IsPlayerValid(pid) then return end
+	if not validPlayer(pid) then return end
 	if kind == "thrust" then
 		R.ovT[pid] = clampMul(pct, MUL_T_MAX)
 	elseif kind == "fuel" then
@@ -578,7 +545,7 @@ function server.applyProfile(name, silent)
 end
 
 function server.saveCustom(slot)
-	slot = math.floor(num(slot, 0))
+	slot = floor(num(slot, 0))
 	if slot ~= 1 and slot ~= 2 then return end
 	local p = { thrust = S.thrust, cap = S.cap, smooth = S.smooth, fuel = S.fuelOn, tank = S.tank }
 	PROFILES["custom" .. slot] = p
@@ -603,6 +570,9 @@ function server.resetAll()
 	server.setCeiling(0)
 	server.setHostFree(false)
 	server.setHover(true)
+	server.setBoostOn(false)
+	server.setBoostCd(BOOST_CD_DEFAULT)
+	server.setBoostCost(BOOST_COST_DEFAULT)
 	server.setUpgrades(false)
 	R.ovT, R.ovF = {}, {}
 	publishMuls()
@@ -611,52 +581,75 @@ function server.resetAll()
 	notify("Host reset all Jetpack settings")
 end
 
-function server.setPlayerBind(pid, bind)
-	if type(pid) ~= "number" or not IsPlayerValid(pid) then return end
+function server.setPlayerBind(pid, bind, boostBind)
+	if not validPlayer(pid) then return end
 	bind = normalizeBind(bind)
 	if bind then R.binds[pid] = bind end
+	boostBind = normalizeBind(boostBind)
+	if boostBind then R.boostBinds[pid] = boostBind end
 end
 
-function server.tick(dt)
-	pcall(function()
-		local count = GetPlayerCount()
-		if count ~= S.playerCount then
-			S.playerCount = count
-			forgetLeftPlayers()
-		end
-	end)
+local function checkPlayers()
+	local count = GetPlayerCount()
+	if count ~= S.playerCount then
+		S.playerCount = count
+		forgetLeftPlayers()
+	end
 end
 
--- One player, one physics step. Split out so stepPlayers stays small.
-local function stepOne(p, dt, flying)
+function server.tick()
+	pcall(checkPlayers)
+end
+
+local function reportError(err)
+	if S.errorShown then return end
+	S.errorShown = true
+	DebugPrint("Jetpack (Multiplayer) error: " .. tostring(err))
+end
+
+-- One player, one physics step.
+local function stepOne(p, dt, flying, boosting)
 	local s = statsFor(p)
 	local health = GetPlayerHealth(p)
 	local inVehicle = GetPlayerVehicle(p) ~= 0
 	local free = S.hostFree and IsPlayerHost(p)
+	local fuelOn = S.fuelOn
 	local fuel = R.fuel
+	local up = S.upgrades
 
-	if S.fuelOn then
-		if fuel[p] == nil or health <= 0 or free then
-			fuel[p] = S.tank
-		elseif fuel[p] > S.tank then
-			fuel[p] = S.tank
-		end
+	if fuelOn and (fuel[p] == nil or health <= 0 or free or fuel[p] > S.tank) then
+		fuel[p] = S.tank
 	end
 
-	local endurance = (R.ovF[p] or 100) / 100 * (1 + upBonus(UPGRADES[1], s.time, S.upgrades))
-	local thrustMul = (R.ovT[p] or 100) / 100 * (1 + upBonus(UPGRADES[2], s.time, S.upgrades))
-	local refillMul = 1 + upBonus(UPGRADES[3], s.time, S.upgrades)
+	local endurance = (R.ovF[p] or 100) / 100 * (1 + upBonus(UPGRADES[1], s.time, up))
+	local thrustMul = (R.ovT[p] or 100) / 100 * (1 + upBonus(UPGRADES[2], s.time, up))
+	local refillMul = 1 + upBonus(UPGRADES[3], s.time, up)
 
 	local wantsToFly = canFly(p) and health > 0 and not inVehicle and inputHeld(R.binds[p] or "jump", p)
-	local hasFuel = not S.fuelOn or free or (fuel[p] or 0) > 0.02
+	local hasFuel = not fuelOn or free or fuel[p] > 0.02
 	local flyingNow = wantsToFly and hasFuel
 
 	local pos = GetPlayerTransform(p).pos
 	local grounded = inVehicle or isGrounded(p)
 
 	if grounded or health <= 0 or R.baseY[p] == nil then R.baseY[p] = pos[2] end
-	local ceilRoom = nil
-	if S.ceiling > 0 then ceilRoom = S.ceiling - (pos[2] - R.baseY[p]) end
+	local ceilRoom = S.ceiling > 0 and (S.ceiling - (pos[2] - R.baseY[p])) or nil
+
+	-- Boost: rising edge on the boost key while flying, once the cooldown is over.
+	local boostHeld = S.boostOn and inputHeld(R.boostBinds[p] or "q", p) or false
+	local cd = max(0, (R.boostCdT[p] or 0) - dt)
+	R.boostCdT[p] = cd
+	if flyingNow and boostHeld and not R.boostPrev[p] and cd <= 0 then
+		local cost = S.boostCost
+		if not fuelOn or free or cost <= 0 or fuel[p] >= cost then
+			R.boostLeft[p] = BOOST_TIME
+			R.boostCdT[p] = S.boostCd
+			if fuelOn and not free then fuel[p] = max(0, fuel[p] - cost) end
+			s.boosts = s.boosts + 1
+			s.dirty = true
+		end
+	end
+	R.boostPrev[p] = boostHeld
 
 	if flyingNow then
 		R.groundedFor[p] = 0
@@ -665,32 +658,41 @@ local function stepOne(p, dt, flying)
 		s.dirty = true
 
 		local power = S.smooth and rampPower(R.ramp[p]) or 1
+		local boostK, capK = 1, 1
+		local left = R.boostLeft[p] or 0
+		if left > 0 then
+			R.boostLeft[p] = left - dt
+			boostK, capK, power = BOOST_MUL, 1.5, 1
+			boosting[#boosting + 1] = p
+		end
 
-		local t = THRUST_BASE * S.thrust / 100 * thrustMul * power
+		local thrust = THRUST_BASE * S.thrust / 100 * thrustMul * power * boostK
 		local vel = GetPlayerVelocity(p)
-		local push = TransformToParentVec(GetPlayerCameraTransform(p), Vec(0, t, 0))
+		local push = TransformToParentVec(GetPlayerCameraTransform(p), Vec(0, thrust, 0))
 
 		local assist = S.hover and inputHeld("crouch", p)
 		if assist then push = Vec(push[1], 0, push[3]) end
 
-		local newVel = capSpeed(vel, VecAdd(vel, push), S.cap)
+		local newVel = capSpeed(vel, VecAdd(vel, push), S.cap * capK)
 		if assist then
-			-- Pull vertical speed towards what cancels the next step of gravity.
+			-- pull vertical speed towards what cancels the next step of gravity
 			local vy = newVel[2]
-			newVel = Vec(newVel[1], vy + (10 * dt - vy) * math.min(1, dt * 14), newVel[3])
+			newVel = Vec(newVel[1], vy + (10 * dt - vy) * min(1, dt * 14), newVel[3])
 		end
 		if ceilRoom then
-			local vmax = ceilRoom > 0 and math.sqrt(2 * 10 * ceilRoom) or 0
+			local vmax = ceilRoom > 0 and sqrt(20 * ceilRoom) or 0
 			if newVel[2] > vmax then newVel = Vec(newVel[1], vmax, newVel[3]) end
 		end
 		SetPlayerVelocity(newVel, p)
 		flying[#flying + 1] = p
-		if S.fuelOn and not free then fuel[p] = math.max(0, fuel[p] - dt / endurance) end
+		if fuelOn and not free then fuel[p] = max(0, fuel[p] - dt / endurance) end
 	else
-		R.ramp[p] = math.max(0, (R.ramp[p] or 0) - dt * 3)
-		if grounded then R.groundedFor[p] = (R.groundedFor[p] or 0) + dt else R.groundedFor[p] = 0 end
-		if S.fuelOn and grounded and R.groundedFor[p] >= S.delay then
-			fuel[p] = math.min(S.tank, fuel[p] + dt * S.tank / S.refill * refillMul)
+		R.ramp[p] = max(0, (R.ramp[p] or 0) - dt * 3)
+		R.boostLeft[p] = 0
+		local gf = grounded and ((R.groundedFor[p] or 0) + dt) or 0
+		R.groundedFor[p] = gf
+		if fuelOn and grounded and gf >= S.delay then
+			fuel[p] = min(S.tank, fuel[p] + dt * S.tank / S.refill * refillMul)
 		end
 	end
 
@@ -698,7 +700,11 @@ local function stepOne(p, dt, flying)
 	if flyingNow then R.airborne[p] = true end
 	if grounded or health <= 0 then R.airborne[p] = false end
 	local moved = 0
-	if R.lastX[p] then moved = math.sqrt((pos[1] - R.lastX[p]) ^ 2 + (pos[3] - R.lastZ[p]) ^ 2) end
+	local lx = R.lastX[p]
+	if lx then
+		local dx, dz = pos[1] - lx, pos[3] - R.lastZ[p]
+		moved = sqrt(dx * dx + dz * dz)
+	end
 	R.lastX[p], R.lastZ[p] = pos[1], pos[3]
 	if R.airborne[p] and moved < 20 then
 		s.dist = s.dist + moved
@@ -709,19 +715,20 @@ local function stepOne(p, dt, flying)
 end
 
 local function stepPlayers(dt)
-	local flying = {}
+	local flying, boosting = {}, {}
 	for _, p in ipairs(GetAllPlayers()) do
 		-- one broken player can never stop the others
-		local ok, err = pcall(stepOne, p, dt, flying)
-		if not ok and not S.errorShown then
-			S.errorShown = true
-			DebugPrint("Jetpack (Multiplayer) error: " .. tostring(err))
-		end
+		local ok, err = pcall(stepOne, p, dt, flying, boosting)
+		if not ok then reportError(err) end
 	end
 
 	if not sameList(flying, S.lastJetting) then
 		shared.jetting = flying
 		S.lastJetting = flying
+	end
+	if not sameList(boosting, S.lastBoosting) then
+		shared.boosting = boosting
+		S.lastBoosting = boosting
 	end
 
 	if S.fuelOn then
@@ -746,10 +753,7 @@ end
 
 function server.update(dt)
 	local ok, err = pcall(stepPlayers, dt)
-	if not ok and not S.errorShown then
-		S.errorShown = true
-		DebugPrint("Jetpack (Multiplayer) server error: " .. tostring(err))
-	end
+	if not ok then reportError(err) end
 end
 
 end  -- server scope
@@ -757,10 +761,9 @@ end  -- server scope
 
 local function buildClient()  -- client scope
 
--- text (English only). Keys ending in _sp are used instead in single player.
+-- text (English only)
 local STRINGS = {
 	title = "Jetpack Settings", host_view = "Host settings", player_view = "Player view",
-	host_view_sp = "Single player",
 	host_stats = "%d players   -   %d flying", close = "Close", on = "On", off = "Off",
 	version_line = "Version %s   -   Revision %d",
 	hint_pad = "Confirm: select    Cancel: close    LB / RB: tabs",
@@ -768,13 +771,10 @@ local STRINGS = {
 	not_allowed = "The host has not allowed you to use the jetpack.",
 
 	sec_game = "Game", sec_host = "Host tools", sec_you = "You",
-	sec_game_sp = "Jetpack", sec_host_sp = "Tools", sec_you_sp = "Personal",
-	tab_flight = "Flight", tab_fuel = "Fuel", tab_players = "Players", tab_admin = "Admin",
-	tab_admin_sp = "Tools",
+	tab_flight = "Flight", tab_fuel = "Fuel & Boost", tab_players = "Players", tab_admin = "Admin",
 	tab_controls = "Controls", tab_hud = "HUD", tab_stats = "Stats",
 
 	jetpack = "Jetpack", jetpack_sub = "Turn the jetpack on or off for everyone",
-	jetpack_sub_sp = "Turn the jetpack on or off",
 	thrust = "Thrust", thrust_sub = "%d%% - %d%%, where 100%% is the original",
 	speed_cap = "Speed cap", speed_cap_sub = "The fastest the jetpack can push you",
 	speed_value = "%d m/s", speed_off = "No limit",
@@ -786,8 +786,10 @@ local STRINGS = {
 	tank = "Tank size", tank_sub = "How many seconds you can fly",
 	refill_time = "Refill speed", refill_time_sub = "Seconds to fill an empty tank",
 	refill_delay = "Refill wait", refill_delay_sub = "Seconds on the ground before refilling starts",
+	boost = "Boost", boost_sub = "Press the boost key while flying for a quick burst",
+	boost_cd = "Boost cooldown", boost_cd_sub = "Seconds before you can boost again",
+	boost_cost = "Boost fuel cost", boost_cost_sub = "Fuel used per boost (needs Fuel on)",
 	upgrades = "Upgrades", upgrades_sub = "Fly more to unlock bigger tank, thrust and refill",
-	upgrades_sub_sp = "Fly more to unlock a bigger tank, thrust and refill",
 
 	approval = "Approval mode", approval_on_sub = "Only players marked Can fly can use the jetpack",
 	approval_off_sub = "Everyone can fly. Blocking a player turns approval mode on.",
@@ -800,23 +802,19 @@ local STRINGS = {
 	custom_1 = "Custom 1", custom_2 = "Custom 2", save_to = "Save current setup to",
 	toast_applied = "Applied %s", toast_saved = "Saved current setup as %s",
 	host_free = "Host flies freely", host_free_sub = "You never run out of fuel. Resets when the session ends.",
-	host_free_sub_sp = "You never run out of fuel. Resets when you leave.",
 	menu_hidden = "Hide settings menu", menu_hidden_sub = "Players no longer see this menu. You always do.",
 	announce = "Settings messages", announce_sub = "Tell everyone when you change a setting",
-	refill_all = "Refill everyone", refill_all_sp = "Refill tank",
-	clear_overrides = "Clear overrides",
+	refill_all = "Refill everyone", clear_overrides = "Clear overrides",
 	reset_stats = "Reset stats", reset_all = "Reset all", confirm_short = "Confirm?",
-	toast_refilled = "Everyone's tank is full", toast_refilled_sp = "Your tank is full",
-	toast_cleared = "Player overrides cleared",
+	toast_refilled = "Everyone's tank is full", toast_cleared = "Player overrides cleared",
 	toast_stats_reset = "Flight stats and upgrades reset", toast_all_reset = "All host settings reset",
-	toast_all_reset_sp = "All jetpack settings reset",
-	reset_all_sp = "Reset all",
 
 	flight_key = "Flight key",
 	key_sub_kb = "Click the button, then press a key",
 	key_sub_pad = "Pick the action that makes you fly",
 	press_key = "Press a key...", clear = "Clear", kb_only = "Keyboard only",
-	key_in_use = "That key is already used for flying",
+	key_in_use = "That key is already used for flying or boost",
+	boost_key = "Boost key", boost_key_sub = "Press it while flying for a short burst",
 	menu_key = "Menu key", menu_key_sub = "Open and close this menu without pausing", menu_key_none = "Not set",
 	effects = "Exhaust effects", effects_sub = "Flames and smoke behind jetpacks",
 	fx_off = "Off", fx_light = "Flames", fx_full = "Full",
@@ -825,7 +823,6 @@ local STRINGS = {
 	flame_orange = "Orange", flame_blue = "Blue", flame_green = "Green", flame_purple = "Purple", flame_pink = "Pink",
 	last_tab = "Reopen on last tab", last_tab_sub = "Open this menu where you left it",
 	reset_personal = "Reset my settings", reset_personal_sub = "Keys, effects, colours and HUD. Host settings stay.",
-	reset_personal_sub_sp = "Keys, effects, colours and HUD.",
 	toast_personal_reset = "Personal settings reset",
 
 	gauge = "Auto-hide fuel gauge", gauge_sub = "Fade the gauge out after a few seconds on the ground",
@@ -839,14 +836,14 @@ local STRINGS = {
 
 	stat_peak = "PEAK HEIGHT", stat_peak_sub = "above take-off",
 	stat_dist = "DISTANCE FLOWN", stat_dist_sub = "all time",
-	stat_time = "FLIGHT TIME",
-	up_title = "Upgrades", up_off = "Off - turn them on under Fuel",
+	stat_time = "FLIGHT TIME", stat_boosts = "%d boosts",
+	up_title = "Upgrades", up_off = "Off - turn them on under Fuel & Boost",
 	up_tier = "Tier %d   +%d%%", up_locked = "Locked", up_max = "MAX",
 	pilots = "Pilots", pilots_more = "Pilots (+%d more)",
 	col_peak = "PEAK", col_dist = "DISTANCE", col_time = "TIME",
 
 	hud_fuel = "FUEL  %.1fs", hud_empty = "FUEL EMPTY",
-	alt_value = "ALT %d m",
+	boost_ready = "BOOST READY", boost_wait = "BOOST  %ds", alt_value = "ALT %d m",
 
 	act_jump = "Jump", act_crouch = "Crouch", act_interact = "Interact",
 	act_flashlight = "Flashlight", act_grab = "Grab", act_usetool = "Use tool",
@@ -854,17 +851,29 @@ local STRINGS = {
 	key_tab = "Tab", key_rmb = "Right click", key_mmb = "Middle click",
 }
 
+-- single player wording, used instead of the above
+local SP_STRINGS = {
+	host_view = "Single player",
+	sec_game = "Jetpack", sec_host = "Tools", sec_you = "Personal", tab_admin = "Tools",
+	jetpack_sub = "Turn the jetpack on or off",
+	upgrades_sub = "Fly more to unlock a bigger tank, thrust and refill",
+	host_free_sub = "You never run out of fuel. Resets when you leave.",
+	refill_all = "Refill tank", toast_refilled = "Your tank is full",
+	toast_all_reset = "All jetpack settings reset",
+	reset_personal_sub = "Keys, effects, colours and HUD.",
+}
+
 -- client state, all in one table
 local K = {
 	sp = false, open = false, openedAt = 0, tab = "flight", lastTab = "flight", remember = true,
-	quickKey = "", kb = "jump", pad = "jump",
+	quickKey = "", kb = "jump", pad = "jump", boostKb = "q", boostPad = "interact",
 	capturing = false, captureTarget = "fly", captureStart = 0, bindTimer = BIND_RESEND, wasPad = false,
 	localFuel = nil, lastFuelOn = false,
 	autoHide = true, gaugeAlpha = 1, groundTime = 0, gaugeSize = 2, gaugePos = 1, gaugeColor = 1,
 	speedHud = false, speedShown = 0, speedUnit = 1, altHud = false, altShown = 0, altGroundY = nil,
-	fx = 2, flame = 1, toastText = "", toastUntil = 0, noteText = "", noteUntil = 0, lastNoteSeq = nil,
-	page = 1, armedId = nil, armedUntil = 0,
-	accent = 1, accentLoaded = false, snd = 0,
+	fx = 2, flame = FLAME_DEFAULT, toastText = "", toastUntil = 0, noteText = "", noteUntil = 0, lastNoteSeq = nil,
+	boostCd = 0, wasBoosting = false, page = 1, armedId = nil, armedUntil = 0,
+	accent = ACCENT_DEFAULT, snd = 0,
 }
 
 local TABS = {}
@@ -880,7 +889,7 @@ local SPEED_FACTOR = { 1, 3.6, 2.23694 }
 local SPEED_UNIT_KEYS = { "unit_ms", "unit_kmh", "unit_mph" }
 
 local function T(key, ...)
-	local text = (K.sp and STRINGS[key .. "_sp"]) or STRINGS[key] or key
+	local text = (K.sp and SP_STRINGS[key]) or STRINGS[key] or key
 	if select("#", ...) > 0 then
 		local ok, out = pcall(string.format, text, ...)
 		if ok then return out end
@@ -890,15 +899,15 @@ end
 
 local function fmtDist(m)
 	if m >= 1000 then return string.format("%.2f km", m / 1000) end
-	return string.format("%d m", math.floor(m))
+	return string.format("%d m", floor(m))
 end
 
 local function fmtTime(s)
-	s = math.floor(s)
+	s = floor(s)
 	if s >= 3600 then
-		return string.format("%d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60)
+		return string.format("%d:%02d:%02d", floor(s / 3600), floor((s % 3600) / 60), s % 60)
 	end
-	return string.format("%d:%02d", math.floor(s / 60), s % 60)
+	return string.format("%d:%02d", floor(s / 60), s % 60)
 end
 
 local function listIndex(list, stride, pid)
@@ -918,9 +927,9 @@ end
 
 local function getStats(pid)
 	local list = shared.ps
-	local i = listIndex(list, 4, pid)
-	if i then return list[i + 1], list[i + 2], list[i + 3] end
-	return 0, 0, 0
+	local i = listIndex(list, 5, pid)
+	if i then return list[i + 1], list[i + 2], list[i + 3], list[i + 4] end
+	return 0, 0, 0, 0
 end
 
 local function fuelMultipliers(pid)
@@ -938,6 +947,7 @@ local function listHas(list, pid)
 	return false
 end
 
+-- Server settings are shown optimistically for a moment while the server catches up.
 local function setPending(key, value)
 	pending[key] = { value = value, expires = GetTime() + 0.6 }
 end
@@ -948,23 +958,23 @@ local function pendingValue(key, actual)
 	return actual
 end
 
+local function send(key, fn, value)
+	setPending(key, value)
+	ServerCall(fn, value)
+end
+
 local function usingPad()
 	local ok, device = pcall(LastInputDevice)
 	return ok and device == 2
 end
 
-local function sendBind()
+local function sendBind(pad)
 	K.bindTimer = 0
-	local pad = usingPad()
-	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb)
+	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb)
 end
 
-local function activeBind() return usingPad() and K.pad or K.kb end
-
 local function bindLabel(name)
-	if STRINGS["act_" .. name] then return T("act_" .. name) end
-	if STRINGS["key_" .. name] then return T("key_" .. name) end
-	return string.upper(name)
+	return STRINGS["act_" .. name] or STRINGS["key_" .. name] or string.upper(name)
 end
 
 local function cycleList(list, current, step)
@@ -976,11 +986,12 @@ end
 
 -- colours -------------------------------------------------------------------
 
-local ACCENT = { 1.0, 0.82, 0.18 }
+local ACCENT = { 0.40, 0.90, 0.68 }
+-- Accent colours are saved by position, so new ones only go at the end.
 local ACCENT_PALETTE = {
 	{ 1.0, 0.82, 0.18 }, { 0.35, 0.70, 0.95 }, { 0.45, 0.85, 0.55 }, { 0.95, 0.50, 0.75 },
 	{ 1.0, 0.55, 0.20 }, { 0.92, 0.32, 0.32 }, { 0.68, 0.50, 0.95 }, { 0.30, 0.82, 0.78 },
-	{ 0.72, 0.90, 0.25 }, { 0.92, 0.92, 0.92 },
+	{ 0.72, 0.90, 0.25 }, { 0.92, 0.92, 0.92 }, { 0.40, 0.90, 0.68 },  -- 11 mint (default)
 }
 local FLAME_PALETTE = {
 	{ 1.0, 0.75, 0.3,  1.0, 0.25, 0.1 },
@@ -992,14 +1003,8 @@ local FLAME_PALETTE = {
 local FLAME_KEYS = { "flame_orange", "flame_blue", "flame_green", "flame_purple", "flame_pink" }
 local GAUGE_KEYS = { "gc_accent", "gc_cb", "gc_green", "gc_cyan", "gc_white" }
 local GAUGE_PALETTE = { false, { 0.34, 0.71, 0.91 }, { 0.45, 0.85, 0.55 }, { 0.30, 0.82, 0.90 }, { 0.95, 0.95, 0.95 } }
-
-local function setAccent(i, save)
-	i = ACCENT_PALETTE[i] and i or 1
-	K.accent = i
-	local c = ACCENT_PALETTE[i]
-	ACCENT[1], ACCENT[2], ACCENT[3] = c[1], c[2], c[3]
-	if save then SetInt("savegame.mod.accent", i) end
-end
+local GAUGE_LOW = { 0.95, 0.28, 0.24 }
+local GAUGE_LOW_CB = { 0.84, 0.37, 0.0 }
 
 local PANEL  = { 0.07, 0.07, 0.08 }
 local BTN    = { 0.20, 0.20, 0.22 }
@@ -1009,22 +1014,45 @@ local WHITE  = { 1, 1, 1 }
 local DARK   = { 0.08, 0.08, 0.08 }
 local GOOD   = { 0.45, 0.85, 0.55 }
 local BAD    = { 0.90, 0.45, 0.45 }
+local GREY   = { 0.6, 0.6, 0.65 }
+local OFF_SWITCH = { 0.32, 0.32, 0.35 }
 
--- personal setters --------------------------------------------------------------
+-- personal settings (only affect this player, saved on this PC) -------------------------
 
-local function setKbBind(v) K.kb = v SetString("savegame.mod.flykey", v) sendBind() end
-local function setPadBind(v) K.pad = v SetString("savegame.mod.padkey", v) sendBind() end
-local function setGaugeAutoHide(on) K.autoHide = on and true or false SetInt("savegame.mod.hudautohideoff", K.autoHide and 0 or 1) end
-local function setSpeedHud(on) K.speedHud = on and true or false SetInt("savegame.mod.speedhud", K.speedHud and 1 or 0) end
-local function setSpeedUnit(v) K.speedUnit = SPEED_FACTOR[v] and v or 1 SetInt("savegame.mod.speed_unit", K.speedUnit) end
-local function setAltHud(on) K.altHud = on and true or false K.altGroundY = nil SetInt("savegame.mod.alt_hud", K.altHud and 1 or 0) end
+local function setAccent(i, save)
+	i = ACCENT_PALETTE[i] and i or ACCENT_DEFAULT  -- 0 = never chosen
+	K.accent = i
+	local c = ACCENT_PALETTE[i]
+	ACCENT[1], ACCENT[2], ACCENT[3] = c[1], c[2], c[3]
+	if save then SetInt("savegame.mod.accent", i) end
+end
+
+local function setStr(field, key, v) K[field] = v SetString(key, v) end
+local function setInt(field, key, v) K[field] = v SetInt(key, v) end
+local function setFlag(field, key, on, inv)
+	on = on and true or false
+	K[field] = on
+	SetInt(key, (on ~= inv) and 1 or 0)
+end
+
+local function setKbBind(v, pad) setStr("kb", "savegame.mod.flykey", v) sendBind(pad) end
+local function setPadBind(v, pad) setStr("pad", "savegame.mod.padkey", v) sendBind(pad) end
+local function setBoostKb(v, pad) setStr("boostKb", "savegame.mod.boostkey", v) sendBind(pad) end
+local function setBoostPad(v, pad) setStr("boostPad", "savegame.mod.boostpadkey", v) sendBind(pad) end
+local function setGaugeAutoHide(on) setFlag("autoHide", "savegame.mod.hudautohideoff", on, true) end
+local function setSpeedHud(on) setFlag("speedHud", "savegame.mod.speedhud", on, false) end
+local function setAltHud(on) setFlag("altHud", "savegame.mod.alt_hud", on, false) K.altGroundY = nil end
+local function setRememberTab(on) setFlag("remember", "savegame.mod.tab_forget", on, true) end
+local function setSpeedUnit(v) setInt("speedUnit", "savegame.mod.speed_unit", SPEED_FACTOR[v] and v or 1) end
+local function setFlame(i) setInt("flame", "savegame.mod.flame", FLAME_PALETTE[i] and i or FLAME_DEFAULT) end
+local function setGaugeSize(v) setInt("gaugeSize", "savegame.mod.gauge_size", v) end
+local function setGaugePos(v) setInt("gaugePos", "savegame.mod.gauge_pos", v) end
 local function setFxMode(mode) K.fx = mode % 3 SetInt("savegame.mod.fxmode", K.fx + 1) end
-local function setFlame(i) K.flame = FLAME_PALETTE[i] and i or 1 SetInt("savegame.mod.flame", K.flame) end
-local function setGaugeSize(v) K.gaugeSize = v SetInt("savegame.mod.gauge_size", v) end
-local function setGaugePos(v) K.gaugePos = v SetInt("savegame.mod.gauge_pos", v) end
-local function setGaugeColor(i) K.gaugeColor = GAUGE_PALETTE[i] ~= nil and i or 1 SetInt("savegame.mod.gauge_cb", K.gaugeColor - 1) end
-local function setQuickKey(key) K.quickKey = key SetString("savegame.mod.menukey", key) end
-local function setRememberTab(on) K.remember = on and true or false SetInt("savegame.mod.tab_forget", K.remember and 0 or 1) end
+local function setGaugeColor(i)
+	K.gaugeColor = GAUGE_PALETTE[i] ~= nil and i or 1
+	SetInt("savegame.mod.gauge_cb", K.gaugeColor - 1)
+end
+local function setQuickKey(key) setStr("quickKey", "savegame.mod.menukey", key) end
 
 local function startCapture(target)
 	K.capturing = true
@@ -1032,22 +1060,23 @@ local function startCapture(target)
 	K.captureStart = GetTime()
 end
 
-local function pollCapture()
+local function pollCapture(pad)
 	if not K.capturing or GetTime() - K.captureStart < 0.2 then return end
 	local key = InputLastPressedKey()
 	if key == "" or key == "lmb" then return end
 	K.capturing = false
-	if key == "esc" then return end
-	if VALID_INPUTS[key] then
-		if K.captureTarget == "menu" then
-			if key == K.kb then
-				K.toastText, K.toastUntil = T("key_in_use"), GetTime() + 3
-			else
-				setQuickKey(key)
-			end
+	if key == "esc" or not VALID_INPUTS[key] then return end
+	local target = K.captureTarget
+	if target == "boost" then
+		setBoostKb(key, pad)
+	elseif target == "menu" then
+		if key == K.kb or key == K.boostKb then
+			K.toastText, K.toastUntil = T("key_in_use"), GetTime() + 3
 		else
-			setKbBind(key)
+			setQuickKey(key)
 		end
+	else
+		setKbBind(key, pad)
 	end
 end
 
@@ -1084,24 +1113,30 @@ end
 
 local function jitter(amount) return GetRandomFloat(-amount, amount) end
 
-local function spawnExhaust(player, mode)
+local function spawnExhaust(player, mode, boosted)
 	local t = GetPlayerTransform(player)
 	local origin = TransformToParentPoint(t, Vec(0, 0.85, 0.3))
 	local carry = VecScale(GetPlayerVelocity(player), 0.5)
-	local f = FLAME_PALETTE[K.flame] or FLAME_PALETTE[1]
+	local f = FLAME_PALETTE[K.flame] or FLAME_PALETTE[FLAME_DEFAULT]
+	local down = boosted and -6 or -3.5
 
-	for i = 1, 2 do
+	for _ = 1, boosted and 5 or 2 do
 		ParticleReset()
 		ParticleType("plain")
 		ParticleTile(5)
-		ParticleColor(f[1], f[2], f[3], f[4], f[5], f[6])
-		ParticleRadius(0.07, 0.02, "easeout")
+		if boosted then
+			ParticleColor(min(1, f[1] + 0.3), min(1, f[2] + 0.3), min(1, f[3] + 0.3), f[4], f[5], f[6])
+			ParticleRadius(0.13, 0.03, "easeout")
+		else
+			ParticleColor(f[1], f[2], f[3], f[4], f[5], f[6])
+			ParticleRadius(0.07, 0.02, "easeout")
+		end
 		ParticleAlpha(1.0, 0.0, "easeout", 0, 0.4)
 		ParticleEmissive(6, 0, "easeout")
 		ParticleGravity(0)
 		ParticleDrag(0.2)
 		ParticleCollide(0)
-		SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.4), -3.5 + jitter(0.5), jitter(0.4))), 0.3)
+		SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.4), down + jitter(0.5), jitter(0.4))), 0.3)
 	end
 
 	if mode < 2 then return end
@@ -1115,7 +1150,7 @@ local function spawnExhaust(player, mode)
 	ParticleDrag(0.4)
 	SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.3), -1.8, jitter(0.3))), 1.2)
 
-	PointLight(VecAdd(origin, Vec(0, -0.4, 0)), f[4], (f[5] + f[2]) / 2, f[6], 2.5)
+	PointLight(VecAdd(origin, Vec(0, -0.4, 0)), f[4], (f[5] + f[2]) / 2, f[6], boosted and 5 or 2.5)
 end
 
 function client.init()
@@ -1123,46 +1158,53 @@ function client.init()
 
 	local v = normalizeBind(GetString("savegame.mod.flykey"))
 	if v then K.kb = v end
-	local pad = GetString("savegame.mod.padkey")
-	if PAD_VALID[pad] then K.pad = pad end
-	K.autoHide = GetInt("savegame.mod.hudautohideoff") ~= 1
-	K.speedHud = GetInt("savegame.mod.speedhud") == 1
-	local unit = GetInt("savegame.mod.speed_unit")
-	if SPEED_FACTOR[unit] then K.speedUnit = unit end
-	K.altHud = GetInt("savegame.mod.alt_hud") == 1
-
+	v = normalizeBind(GetString("savegame.mod.boostkey"))
+	if v then K.boostKb = v end
 	v = normalizeBind(GetString("savegame.mod.menukey"))
 	if v then K.quickKey = v end
+	v = GetString("savegame.mod.padkey")
+	if PAD_VALID[v] then K.pad = v end
+	v = GetString("savegame.mod.boostpadkey")
+	if PAD_VALID[v] then K.boostPad = v end
+
+	K.autoHide = GetInt("savegame.mod.hudautohideoff") ~= 1
+	K.speedHud = GetInt("savegame.mod.speedhud") == 1
+	K.altHud = GetInt("savegame.mod.alt_hud") == 1
 	K.remember = GetInt("savegame.mod.tab_forget") ~= 1
+
+	v = GetInt("savegame.mod.speed_unit")
+	if SPEED_FACTOR[v] then K.speedUnit = v end
+
 	local savedTab = GetString("savegame.mod.last_tab")
 	if savedTab ~= "" then K.lastTab = LEGACY_TABS[savedTab] or savedTab end
 
-	local fx = GetInt("savegame.mod.fxmode")
-	if fx >= 1 and fx <= 3 then K.fx = fx - 1 end
-	local flame = GetInt("savegame.mod.flame")
-	if FLAME_PALETTE[flame] then K.flame = flame end
+	v = GetInt("savegame.mod.fxmode")
+	if v >= 1 and v <= 3 then K.fx = v - 1 end
+	v = GetInt("savegame.mod.flame")  -- 0 = never chosen, so the default (mint) applies
+	if FLAME_PALETTE[v] then K.flame = v end
 
-	local size = GetInt("savegame.mod.gauge_size")
-	if size >= 1 and size <= 3 then K.gaugeSize = size end
-	local pos = GetInt("savegame.mod.gauge_pos")
-	if pos >= 1 and pos <= 4 then K.gaugePos = pos end
-	local gc = GetInt("savegame.mod.gauge_cb") + 1
-	if GAUGE_PALETTE[gc] ~= nil then K.gaugeColor = gc end
+	v = GetInt("savegame.mod.gauge_size")
+	if v >= 1 and v <= 3 then K.gaugeSize = v end
+	v = GetInt("savegame.mod.gauge_pos")
+	if v >= 1 and v <= 4 then K.gaugePos = v end
+	v = GetInt("savegame.mod.gauge_cb") + 1
+	if GAUGE_PALETTE[v] ~= nil then K.gaugeColor = v end
+
+	setAccent(GetInt("savegame.mod.accent"), false)
 end
 
 function client.tick(dt)
 	local me = GetLocalPlayer()
+	local pad = usingPad()
 	K.sp = GetPlayerCount() <= 1
 
 	K.bindTimer = K.bindTimer + dt
-	local pad = usingPad()
 	if K.bindTimer >= BIND_RESEND or pad ~= K.wasPad then
 		K.wasPad = pad
-		sendBind()
+		sendBind(pad)
 	end
 
-	local menuAllowed = IsPlayerHost(me) or shared.menuHidden ~= true
-	if menuAllowed then
+	if IsPlayerHost(me) or shared.menuHidden ~= true then
 		if PauseMenuButton(T("title")) then openSettings() end
 		if K.quickKey ~= "" and not K.capturing and InputPressed(K.quickKey) then
 			if K.open then K.open = false else openSettings() end
@@ -1170,7 +1212,7 @@ function client.tick(dt)
 	elseif K.open then
 		K.open = false
 	end
-	pollCapture()
+	pollCapture(pad)
 
 	local seq = shared.noteSeq
 	if seq ~= nil then
@@ -1194,7 +1236,7 @@ function client.tick(dt)
 
 	if K.speedHud then
 		local ok, vel = pcall(GetPlayerVelocity, me)
-		if ok and vel then K.speedShown = K.speedShown + (VecLength(vel) - K.speedShown) * math.min(1, dt * 10) end
+		if ok and vel then K.speedShown = K.speedShown + (VecLength(vel) - K.speedShown) * min(1, dt * 10) end
 	end
 
 	if K.altHud then
@@ -1202,13 +1244,17 @@ function client.tick(dt)
 		if ok and t then
 			local y = t.pos[2]
 			if K.altGroundY == nil or health <= 0 or inVehicle or isGrounded(me) then K.altGroundY = y end
-			K.altShown = K.altShown + (math.max(0, y - K.altGroundY) - K.altShown) * math.min(1, dt * 10)
+			K.altShown = K.altShown + (max(0, y - K.altGroundY) - K.altShown) * min(1, dt * 10)
 		end
 	end
 
+	local boostingList = shared.boosting
+	local meBoosting = listHas(boostingList, me)
+	if meBoosting and not K.wasBoosting then K.boostCd = shared.boostCd or BOOST_CD_DEFAULT end
+	K.wasBoosting = meBoosting
+	K.boostCd = max(0, K.boostCd - dt)
 
-
-	local wantsToFly = localCanFly() and health > 0 and not inVehicle and inputHeld(activeBind())
+	local wantsToFly = localCanFly() and health > 0 and not inVehicle and inputHeld(pad and K.pad or K.kb)
 	local flying = wantsToFly and (not fuelOn or K.localFuel > 0.02)
 
 	if fuelOn then
@@ -1216,9 +1262,9 @@ function client.tick(dt)
 		local endurance, refillMul = fuelMultipliers(me)
 
 		if flying then
-			K.localFuel = math.max(0, K.localFuel - dt / endurance)
+			K.localFuel = max(0, K.localFuel - dt / endurance)
 		elseif grounded and K.groundTime >= (shared.refillDelay or DELAY_DEFAULT) then
-			K.localFuel = math.min(tank, K.localFuel + dt * tank / (shared.refill or REFILL_DEFAULT) * refillMul)
+			K.localFuel = min(tank, K.localFuel + dt * tank / (shared.refill or REFILL_DEFAULT) * refillMul)
 		end
 
 		local serverValue = serverFuelFor(me)
@@ -1228,7 +1274,7 @@ function client.tick(dt)
 
 		if grounded and not flying then K.groundTime = K.groundTime + dt else K.groundTime = 0 end
 		local target = (K.autoHide and K.groundTime > GAUGE_HIDE_DELAY) and 0 or 1
-		K.gaugeAlpha = K.gaugeAlpha + (target - K.gaugeAlpha) * math.min(1, dt * GAUGE_FADE_RATE)
+		K.gaugeAlpha = K.gaugeAlpha + (target - K.gaugeAlpha) * min(1, dt * GAUGE_FADE_RATE)
 	else
 		K.groundTime = 0
 		K.gaugeAlpha = 1
@@ -1236,7 +1282,7 @@ function client.tick(dt)
 
 	if flying then
 		PlayLoop(K.snd, GetCameraTransform().pos, SOUND_VOLUME)
-		if K.fx > 0 then pcall(spawnExhaust, me, K.fx) end
+		if K.fx > 0 then pcall(spawnExhaust, me, K.fx, meBoosting) end
 	end
 
 	local others = shared.jetting
@@ -1245,7 +1291,7 @@ function client.tick(dt)
 			local p = others[i]
 			if p ~= me and IsPlayerValid(p) then
 				PlayLoop(K.snd, GetPlayerTransform(p).pos, SOUND_VOLUME)
-				if K.fx > 0 then pcall(spawnExhaust, p, K.fx) end
+				if K.fx > 0 then pcall(spawnExhaust, p, K.fx, listHas(boostingList, p)) end
 			end
 		end
 	end
@@ -1256,6 +1302,7 @@ end
 -- Every widget is placed by its centre, relative to the current origin.
 -- Header y -300..-196, body y -180..204 (sidebar left, tab content right),
 -- footer y 216..300. Tab content is laid out from the top of the body down.
+-- Row helpers return what was clicked instead of taking callbacks.
 
 local PANEL_W, PANEL_H = 880, 600
 local BODY_TOP, BODY_H = -180, 384
@@ -1276,8 +1323,7 @@ local function label(text, x, y, size, color, alpha, align, maxWidth)
 		if maxWidth then
 			local width = UiGetTextSize(text)
 			if width > maxWidth then
-				size = math.max(11, math.floor(size * maxWidth / width))
-				UiFont("regular.ttf", size)
+				UiFont("regular.ttf", max(11, floor(size * maxWidth / width)))
 			end
 		end
 		UiColor(color[1], color[2], color[3], alpha or 1)
@@ -1287,7 +1333,7 @@ end
 
 local function isHover(x, y, w, h)
 	if nav.active then return false end
-	local inside = false
+	local inside
 	UiPush()
 		UiTranslate(x - w / 2, y - h / 2)
 		UiAlign("left top")
@@ -1308,6 +1354,7 @@ local function ring(w, h)
 	UiPop()
 end
 
+-- Registers a clickable area for controller focus and returns true when it is activated.
 local function hit(x, y, w, h)
 	local id = #nav.items + 1
 	nav.items[id] = { x = nav.offset + x, y = nav.offsetY + y }
@@ -1339,7 +1386,7 @@ local function hit(x, y, w, h)
 end
 
 local function lighten(color, k)
-	return math.min(color[1] * k, 1), math.min(color[2] * k, 1), math.min(color[3] * k, 1)
+	return min(color[1] * k, 1), min(color[2] * k, 1), min(color[3] * k, 1)
 end
 
 local function card(x, y, w, h, alpha)
@@ -1362,13 +1409,12 @@ local function button(text, x, y, w, h, bg, fg, size, disabled)
 		UiRoundedRect(w, h, 8)
 	UiPop()
 	label(text, x, y, size or 22, fg, a, "center middle", w - 14)
-	local clicked = hit(x, y, w, h)
-	return clicked and not disabled
+	return hit(x, y, w, h) and not disabled
 end
 
 local function switch(x, y, on)
 	local w, h = 60, 30
-	local r, g, b = lighten(on and GREEN or { 0.32, 0.32, 0.35 }, isHover(x, y, w, h) and 1.2 or 1.0)
+	local r, g, b = lighten(on and GREEN or OFF_SWITCH, isHover(x, y, w, h) and 1.2 or 1.0)
 	UiPush()
 		UiTranslate(x, y)
 		UiAlign("center middle")
@@ -1389,9 +1435,8 @@ local function moveFocus(dx, dy)
 		if i ~= nav.focus then
 			local ox, oy = item.x - current.x, item.y - current.y
 			local along = dx * ox + dy * oy
-			local across = math.abs(dx * oy - dy * ox)
 			if along > 4 then
-				local score = along + across * 2
+				local score = along + math.abs(dx * oy - dy * ox) * 2
 				if not bestScore or score < bestScore then best, bestScore = i, score end
 			end
 		end
@@ -1401,7 +1446,7 @@ end
 
 local function handleControllerInput(tabs)
 	if not nav.active then return end
-	nav.focus = math.max(1, math.min(nav.focus, #nav.items))
+	nav.focus = clamp(nav.focus, 1, max(1, #nav.items))
 	if InputPressed("menu_up") then moveFocus(0, -1) end
 	if InputPressed("menu_down") then moveFocus(0, 1) end
 	if InputPressed("menu_left") then moveFocus(-1, 0) end
@@ -1430,31 +1475,29 @@ local function gaugeAnchor()
 	local s = GAUGE_SCALE[K.gaugeSize] or 1
 	local w, h = UiWidth(), UiHeight()
 	local half = 103 * s
-	if K.gaugePos == 2 then return w / 2, 72, s, true end
-	if K.gaugePos == 3 then return 24 + half, h - 72, s, false end
-	if K.gaugePos == 4 then return w - 24 - half, h - 72, s, false end
+	local pos = K.gaugePos
+	if pos == 2 then return w / 2, 72, s, true end
+	if pos == 3 then return 24 + half, h - 72, s, false end
+	if pos == 4 then return w - 24 - half, h - 72, s, false end
 	return w / 2, h - 72, s, false
 end
 
-local function gaugeColors()
-	if K.gaugeColor == 2 then return GAUGE_PALETTE[2], { 0.84, 0.37, 0.0 } end
-	local c = GAUGE_PALETTE[K.gaugeColor]
-	return c or ACCENT, { 0.95, 0.28, 0.24 }
+local function canShowHud(me)
+	return localCanFly() and GetPlayerHealth(me) > 0 and GetPlayerVehicle(me) == 0
 end
 
 local function drawGauge()
 	local me = GetLocalPlayer()
-	if K.gaugeAlpha < 0.02 then return end
-	if not localCanFly() or GetPlayerHealth(me) <= 0 or GetPlayerVehicle(me) ~= 0 then return end
+	if K.gaugeAlpha < 0.02 or not canShowHud(me) then return end
 	if shared.hostFree == true and IsPlayerHost(me) then return end
 
 	local tank = shared.fuelCap or FUEL_DEFAULT
 	local current = K.localFuel or tank
 	local fraction = clamp(current / tank, 0, 1)
 	local a = K.gaugeAlpha
-	local low = fraction > 0.02 and fraction <= 0.22
-	local pulse = low and (0.7 + 0.3 * math.sin(GetTime() * 9)) or 1
-	local normal, lowColor = gaugeColors()
+	local pulse = (fraction > 0.02 and fraction <= 0.22) and (0.7 + 0.3 * math.sin(GetTime() * 9)) or 1
+	local normal = GAUGE_PALETTE[K.gaugeColor] or ACCENT
+	local lowColor = K.gaugeColor == 2 and GAUGE_LOW_CB or GAUGE_LOW
 	local ax, ay, s, top = gaugeAnchor()
 
 	UiPush()
@@ -1471,7 +1514,7 @@ local function drawGauge()
 				UiAlign("left middle")
 				local c = (fraction > 0.22) and normal or lowColor
 				UiColor(c[1], c[2], c[3], 0.95 * a * pulse)
-				UiRoundedRect(math.max(196 * fraction, 6), 8, 4)
+				UiRoundedRect(max(196 * fraction, 6), 8, 4)
 			UiPop()
 		end
 		local ly = top and 17 or -17
@@ -1484,30 +1527,53 @@ local function drawGauge()
 end
 
 local function drawSpeed()
-	local me = GetLocalPlayer()
-	if not localCanFly() or GetPlayerHealth(me) <= 0 or GetPlayerVehicle(me) ~= 0 then return end
+	if not canShowHud(GetLocalPlayer()) then return end
 	local ax, ay, s, top = gaugeAnchor()
-	local lines = {}
+	local dir = top and 1 or -1
+	local line = 0
 	if K.speedHud then
-		lines[#lines + 1] = string.format("%d %s", math.floor(K.speedShown * SPEED_FACTOR[K.speedUnit] + 0.5),
-			T(SPEED_UNIT_KEYS[K.speedUnit]))
+		label(string.format("%d %s", round(K.speedShown * SPEED_FACTOR[K.speedUnit]), T(SPEED_UNIT_KEYS[K.speedUnit])),
+			ax, ay + dir * 40 * s, floor(20 * s), WHITE, 0.8)
+		line = 1
 	end
-	if K.altHud then lines[#lines + 1] = T("alt_value", math.floor(K.altShown + 0.5)) end
-	for i = 1, #lines do
-		label(lines[i], ax, ay + (top and 1 or -1) * (40 + (i - 1) * 24) * s, math.floor(20 * s), WHITE, 0.8)
+	if K.altHud then
+		label(T("alt_value", round(K.altShown)), ax, ay + dir * (40 + line * 24) * s, floor(20 * s), WHITE, 0.8)
 	end
+end
+
+local function drawBoost()
+	if shared.boostOn ~= true or not canShowHud(GetLocalPlayer()) then return end
+
+	local ax, ay, s, top = gaugeAnchor()
+	local dir = top and -1 or 1
+	local y = ay + dir * 24 * s
+	local total = max(1, shared.boostCd or BOOST_CD_DEFAULT)
+	local ready = K.boostCd <= 0
+	local frac = ready and 1 or (1 - K.boostCd / total)
+	local c = ready and GOOD or GREY
+
+	UiPush()
+		UiTranslate(ax - 50 * s, y)
+		UiAlign("left middle")
+		UiColor(1, 1, 1, 0.12)
+		UiRoundedRect(100 * s, 5 * s, 2.5 * s)
+		UiColor(c[1], c[2], c[3], 0.9)
+		UiRoundedRect(max(100 * s * frac, 5 * s), 5 * s, 2.5 * s)
+	UiPop()
+	label(ready and T("boost_ready") or T("boost_wait", math.ceil(K.boostCd)),
+		ax, y + dir * 11 * s, floor(12 * s), c, ready and 0.9 or 0.65)
 end
 
 local function drawNote()
 	local now = GetTime()
 	if now >= K.noteUntil or K.noteText == "" then return end
-	local a = math.min(1, (K.noteUntil - now) / 0.6)
-	local w = 0
+	local a = min(1, (K.noteUntil - now) / 0.6)
+	local w
 	UiPush()
 		UiFont("regular.ttf", 20)
 		w = UiGetTextSize(K.noteText)
 	UiPop()
-	w = math.min(w, UiWidth() - 120)
+	w = min(w, UiWidth() - 120)
 	UiPush()
 		UiTranslate(UiCenter(), 64)
 		UiAlign("center middle")
@@ -1540,61 +1606,99 @@ local function settingRow(top, title, subtitle, maxWidth, alpha)
 	return cy
 end
 
-local function onOffText(x, y, on)
-	label(on and T("on") or T("off"), x, y, 21, on and GOOD or BAD, 1, "right middle")
-end
-
-local function toggleRow(top, title, subtitle, on, canEdit, onToggle, alpha)
+-- returns true when the switch was clicked
+local function toggleRow(top, title, subtitle, on, canEdit, alpha)
 	local cy = settingRow(top, title, subtitle, canEdit and 500 or 440, alpha)
-	if canEdit then
-		if switch(RIGHT - 30, cy, on) then onToggle() end
-	else
-		onOffText(RIGHT, cy, on)
-	end
-	return cy
+	if canEdit then return switch(RIGHT - 30, cy, on) end
+	label(on and T("on") or T("off"), RIGHT, cy, 21, on and GOOD or BAD, 1, "right middle")
+	return false
 end
 
-local function stepRow(top, title, subtitle, valueText, canEdit, onMinus, onPlus, alpha)
+-- returns minusClicked, plusClicked
+local function stepRow(top, title, subtitle, valueText, canEdit, alpha)
 	alpha = alpha or 1
 	local cy = settingRow(top, title, subtitle, canEdit and 380 or 400, alpha)
-	if canEdit then
-		if button("-", RIGHT - 185, cy, 44, 32, BTN, WHITE, 24) then onMinus() end
-		label(valueText, RIGHT - 110, cy, 22, ACCENT, alpha, "center middle", 90)
-		if button("+", RIGHT - 35, cy, 44, 32, BTN, WHITE, 24) then onPlus() end
-	else
+	if not canEdit then
 		label(valueText, RIGHT, cy, 22, ACCENT, alpha, "right middle", 140)
+		return false, false
 	end
-	return cy
+	local minus = button("-", RIGHT - 185, cy, 44, 32, BTN, WHITE, 24)
+	label(valueText, RIGHT - 110, cy, 22, ACCENT, alpha, "center middle", 90)
+	local plus = button("+", RIGHT - 35, cy, 44, 32, BTN, WHITE, 24)
+	return minus, plus
 end
 
-local function choiceRow(top, title, subtitle, options, current, canEdit, onPick, alpha)
+-- returns the index of the option that was picked, or nil
+local function choiceRow(top, title, subtitle, options, current, canEdit, alpha)
 	local n = #options
 	local w = (n == 2) and 120 or ((n == 3) and 104 or ((n == 4) and 80 or 70))
 	local cy = settingRow(top, title, subtitle, CW - PAD * 2 - n * (w + 6) - 10, alpha)
+	local picked
 	for i = 1, n do
 		local x = RIGHT - w / 2 - (n - i) * (w + 6)
 		local active = (current == i)
 		if button(T(options[i]), x, cy, w, 32, active and ACCENT or BTN, active and DARK or WHITE, 16, not canEdit) then
-			onPick(i)
+			picked = i
 		end
 	end
-	return cy
+	return picked
 end
 
-local function armedButton(id, text, x, y, w, h, onConfirm)
+-- returns the index of the swatch that was picked, or nil
+local function swatchRow(top, title, subtitle, palette, current)
+	local cy = settingRow(top, title, subtitle, 200)
+	local n = #palette
+	local picked
+	for i = 1, n do
+		local x = RIGHT - 15 - (n - i) * 31
+		local c = palette[i]
+		UiPush()
+			UiTranslate(x, cy)
+			UiAlign("center middle")
+			if i == current then
+				UiColor(1, 1, 1, 0.9)
+				UiRoundedRect(28, 28, 8)
+			end
+			UiColor(c[1], c[2], c[3], 1)
+			UiRoundedRect(23, 23, 6)
+		UiPop()
+		if hit(x, cy, 28, 28) then picked = i end
+	end
+	return picked
+end
+
+-- two clicks needed: first arms the button, second confirms. Returns true on confirm.
+local function armedButton(id, text, x, y, w, h)
 	local armed = (K.armedId == id) and GetTime() < K.armedUntil
 	if button(armed and T("confirm_short") or text, x, y, w, h, armed and RED or BTN, WHITE, 16) then
 		if armed then
 			K.armedId = nil
-			onConfirm()
-		else
-			K.armedId, K.armedUntil = id, GetTime() + 3
+			return true
 		end
+		K.armedId, K.armedUntil = id, GetTime() + 3
 	end
+	return false
 end
 
 local function toast(text) K.toastText, K.toastUntil = text, GetTime() + 3 end
 
+-- number row that sends clamp(current +/- step) to the server
+local function numRow(c, top, title, sub, key, fn, clampFn, current, step, text, alpha)
+	local minus, plus = stepRow(top, title, sub, text, c.isHost, alpha)
+	if minus or plus then send(key, fn, clampFn(current + (minus and -step or step))) end
+end
+
+-- like numRow, but stepping past the top turns the limit off (0) and "-" from off jumps to the top
+local function limitRow(c, top, title, sub, key, fn, clampFn, current, lo, hi, step, text, alpha)
+	local minus, plus = stepRow(top, title, sub, text, c.isHost, alpha)
+	local v
+	if minus then
+		v = current == 0 and hi or max(lo, current - step)
+	elseif plus and current ~= 0 then
+		v = current + step > hi and 0 or current + step
+	end
+	if v then send(key, fn, clampFn(v)) end
+end
 
 
 -- tabs ---------------------------------------------------------------------------------------
@@ -1603,72 +1707,49 @@ function TABS.flight(c)
 	local h = c.isHost
 	local a = c.enabled and 1 or 0.5
 
-	toggleRow(rowTop(1), T("jetpack"), T("jetpack_sub"), c.enabled, h, function()
-		do local nv = not (c.enabled) setPending("enabled", nv) ServerCall("server.setEnabled", nv) end
-	end)
-
-	local function setThrust(v) local nv = clampThrust(v) setPending("thrust", nv) ServerCall("server.setThrustPct", nv) end
-	stepRow(rowTop(2), T("thrust"), T("thrust_sub", 50, 150), c.thrust .. "%", h,
-		function() setThrust(c.thrust - 10) end,
-		function() setThrust(c.thrust + 10) end, a)
-
-	local function setCap(v) local nv = clampCap(v) setPending("cap", nv) ServerCall("server.setSpeedCap", nv) end
-	stepRow(rowTop(3), T("speed_cap"), T("speed_cap_sub"),
-		c.cap == 0 and T("speed_off") or T("speed_value", c.cap), h,
-		function()
-			if c.cap == 0 then setCap(CAP_MAX) else setCap(math.max(CAP_MIN, c.cap - CAP_STEP)) end
-		end,
-		function()
-			if c.cap == 0 then return end
-			if c.cap + CAP_STEP > CAP_MAX then setCap(0) else setCap(c.cap + CAP_STEP) end
-		end, a)
-
-	local function setCeiling(v) local nv = clampCeiling(v) setPending("ceiling", nv) ServerCall("server.setCeiling", nv) end
-	stepRow(rowTop(4), T("ceiling"), T("ceiling_sub"),
-		c.ceiling == 0 and T("speed_off") or string.format("%d m", c.ceiling), h,
-		function()
-			if c.ceiling == 0 then setCeiling(CEIL_MAX) else setCeiling(math.max(CEIL_MIN, c.ceiling - CEIL_STEP)) end
-		end,
-		function()
-			if c.ceiling == 0 then return end
-			if c.ceiling + CEIL_STEP > CEIL_MAX then setCeiling(0) else setCeiling(c.ceiling + CEIL_STEP) end
-		end, a)
-
-	toggleRow(rowTop(5), T("smooth"), T("smooth_sub"), c.smooth, h, function()
-		do local nv = not (c.smooth) setPending("smooth", nv) ServerCall("server.setSmooth", nv) end
-	end, a)
-
-	toggleRow(rowTop(6), T("hover_assist"), T("hover_assist_sub"), c.hover, h, function()
-		do local nv = not (c.hover) setPending("hover", nv) ServerCall("server.setHover", nv) end
-	end, a)
+	if toggleRow(rowTop(1), T("jetpack"), T("jetpack_sub"), c.enabled, h) then
+		send("enabled", "server.setEnabled", not c.enabled)
+	end
+	numRow(c, rowTop(2), T("thrust"), T("thrust_sub", 50, 150), "thrust", "server.setThrustPct",
+		clampThrust, c.thrust, 10, c.thrust .. "%", a)
+	limitRow(c, rowTop(3), T("speed_cap"), T("speed_cap_sub"), "cap", "server.setSpeedCap",
+		clampCap, c.cap, CAP_MIN, CAP_MAX, CAP_STEP, c.cap == 0 and T("speed_off") or T("speed_value", c.cap), a)
+	limitRow(c, rowTop(4), T("ceiling"), T("ceiling_sub"), "ceiling", "server.setCeiling",
+		clampCeiling, c.ceiling, CEIL_MIN, CEIL_MAX, CEIL_STEP,
+		c.ceiling == 0 and T("speed_off") or string.format("%d m", c.ceiling), a)
+	if toggleRow(rowTop(5), T("smooth"), T("smooth_sub"), c.smooth, h, a) then
+		send("smooth", "server.setSmooth", not c.smooth)
+	end
+	if toggleRow(rowTop(6), T("hover_assist"), T("hover_assist_sub"), c.hover, h, a) then
+		send("hover", "server.setHover", not c.hover)
+	end
 end
 
--- Fuel: four fuel rows, then upgrades. Dimmed rows still work.
+-- Fuel & Boost: four fuel rows, then boost, then upgrades. Dimmed rows still work.
 function TABS.fuel(c)
 	local h = c.isHost
 	local fa = c.fuelOn and 1 or 0.5
+	local ba = c.boostOn and 1 or 0.5
 
-	toggleRow(rowTop(1), T("fuel_system"), T("fuel_sub"), c.fuelOn, h, function()
-		do local nv = not (c.fuelOn) setPending("fuelOn", nv) ServerCall("server.setFuelEnabled", nv) end
-	end)
-
-	local function setTank(v) local nv = clampFuel(v) setPending("tank", nv) ServerCall("server.setFuelCap", nv) end
-	stepRow(rowTop(2), T("tank"), T("tank_sub"), c.tank .. " s", h,
-		function() setTank(c.tank - 1) end, function() setTank(c.tank + 1) end, fa)
-
-	local function setRefill(v) local nv = clampRefill(v) setPending("refill", nv) ServerCall("server.setRefill", nv) end
-	stepRow(rowTop(3), T("refill_time"), T("refill_time_sub"), string.format("%.1f s", c.refill), h,
-		function() setRefill(c.refill - REFILL_STEP) end,
-		function() setRefill(c.refill + REFILL_STEP) end, fa)
-
-	local function setDelay(v) local nv = clampDelay(v) setPending("delay", nv) ServerCall("server.setRefillDelay", nv) end
-	stepRow(rowTop(4), T("refill_delay"), T("refill_delay_sub"), string.format("%.1f s", c.refillDelay), h,
-		function() setDelay(c.refillDelay - DELAY_STEP) end,
-		function() setDelay(c.refillDelay + DELAY_STEP) end, fa)
-
-	toggleRow(rowTop(5), T("upgrades"), T("upgrades_sub"), c.upgrades, h, function()
-		do local nv = not (c.upgrades) setPending("upgrades", nv) ServerCall("server.setUpgrades", nv) end
-	end)
+	if toggleRow(rowTop(1), T("fuel_system"), T("fuel_sub"), c.fuelOn, h) then
+		send("fuelOn", "server.setFuelEnabled", not c.fuelOn)
+	end
+	numRow(c, rowTop(2), T("tank"), T("tank_sub"), "tank", "server.setFuelCap",
+		clampFuel, c.tank, 1, c.tank .. " s", fa)
+	numRow(c, rowTop(3), T("refill_time"), T("refill_time_sub"), "refill", "server.setRefill",
+		clampRefill, c.refill, REFILL_STEP, string.format("%.1f s", c.refill), fa)
+	numRow(c, rowTop(4), T("refill_delay"), T("refill_delay_sub"), "delay", "server.setRefillDelay",
+		clampDelay, c.refillDelay, DELAY_STEP, string.format("%.1f s", c.refillDelay), fa)
+	if toggleRow(rowTop(5), T("boost"), T("boost_sub"), c.boostOn, h) then
+		send("boostOn", "server.setBoostOn", not c.boostOn)
+	end
+	numRow(c, rowTop(6), T("boost_cd"), T("boost_cd_sub"), "boostCd", "server.setBoostCd",
+		clampBoostCd, c.boostCd, 1, string.format("%d s", c.boostCd), ba)
+	numRow(c, rowTop(7), T("boost_cost"), T("boost_cost_sub"), "boostCost", "server.setBoostCost",
+		clampBoostCost, c.boostCost, BOOST_COST_STEP, string.format("%.1f s", c.boostCost), ba)
+	if toggleRow(rowTop(8), T("upgrades"), T("upgrades_sub"), c.upgrades, h) then
+		send("upgrades", "server.setUpgrades", not c.upgrades)
+	end
 end
 
 local STAT_COLORS = { { 1.0, 0.82, 0.18 }, { 0.35, 0.70, 0.95 }, { 0.45, 0.85, 0.55 } }
@@ -1686,13 +1767,18 @@ local function statCard(x, y, w, h, color, title, value, sub)
 	label(sub, x, y + 32, 14, WHITE, 0.4, "center middle", w - 20)
 end
 
+local function byDistance(x, y)
+	if x.dist ~= y.dist then return x.dist > y.dist end
+	return x.p < y.p
+end
+
 function TABS.stats(c)
 	local me = GetLocalPlayer()
-	local peak, dist, time = getStats(me)
+	local peak, dist, time, boosts = getStats(me)
 
 	statCard(-215, 48, 200, 96, STAT_COLORS[1], T("stat_peak"), fmtDist(peak), T("stat_peak_sub"))
 	statCard(0, 48, 200, 96, STAT_COLORS[2], T("stat_dist"), fmtDist(dist), T("stat_dist_sub"))
-	statCard(215, 48, 200, 96, STAT_COLORS[3], T("stat_time"), fmtTime(time), "")
+	statCard(215, 48, 200, 96, STAT_COLORS[3], T("stat_time"), fmtTime(time), T("stat_boosts", boosts))
 
 	local a = c.upgrades and 1 or 0.4
 	card(0, 167, CW, 118)
@@ -1723,9 +1809,9 @@ function TABS.stats(c)
 			UiColor(1, 1, 1, 0.12)
 			UiRoundedRect(250, 6, 3)
 			UiColor(ACCENT[1], ACCENT[2], ACCENT[3], 0.9 * a)
-			UiRoundedRect(math.max(6, 250 * clamp(frac, 0, 1)), 6, 3)
+			UiRoundedRect(max(6, 250 * clamp(frac, 0, 1)), 6, 3)
 		UiPop()
-		local text = tier > 0 and T("up_tier", tier, math.floor(up.bonus[tier] * 100 + 0.5)) or T("up_locked")
+		local text = tier > 0 and T("up_tier", tier, round(up.bonus[tier] * 100)) or T("up_locked")
 		if tier >= #up.at then text = text .. "   " .. T("up_max") end
 		label(text, RIGHT, y, 15, tier > 0 and ACCENT or WHITE, tier > 0 and a or 0.5 * a, "right middle", 190)
 	end
@@ -1735,14 +1821,11 @@ function TABS.stats(c)
 		local pk, ds, tm = getStats(p)
 		rows[#rows + 1] = { p = p, peak = pk, dist = ds, time = tm }
 	end
-	table.sort(rows, function(x, y)
-		if x.dist ~= y.dist then return x.dist > y.dist end
-		return x.p < y.p
-	end)
+	table.sort(rows, byDistance)
 
-	local shown = math.min(4, #rows)
+	local shown = min(4, #rows)
 	local maxDist = 1
-	for i = 1, shown do maxDist = math.max(maxDist, rows[i].dist) end
+	for i = 1, shown do maxDist = max(maxDist, rows[i].dist) end
 
 	card(0, 311, CW, 146)
 	label(#rows > 4 and T("pilots_more", #rows - 4) or T("pilots"), LEFT, 252, 17, WHITE, 0.9, "left middle", 200)
@@ -1758,7 +1841,7 @@ function TABS.stats(c)
 			UiTranslate(-CW / 2 + 12, y)
 			UiAlign("left middle")
 			UiColor(ACCENT[1], ACCENT[2], ACCENT[3], mine and 0.22 or 0.10)
-			UiRoundedRect(math.max(8, (CW - 24) * r.dist / maxDist), 22, 6)
+			UiRoundedRect(max(8, (CW - 24) * r.dist / maxDist), 22, 6)
 		UiPop()
 		label(i .. ".  " .. tostring(GetPlayerName(r.p)), LEFT, y, 17, mine and ACCENT or WHITE, 0.95, "left middle", 190)
 		label(fmtDist(r.peak), 120, y, 16, WHITE, 0.85, "right middle", 70)
@@ -1773,11 +1856,11 @@ local function stepMul(p, kind, current, delta, hi)
 	ServerCall("server.setPlayerMul", p, kind, value)
 end
 
-local function mulColor(v) if v ~= 100 then return ACCENT end return WHITE end
-
 function TABS.players(c)
-	toggleRow(rowTop(1), T("approval"), c.restrict and T("approval_on_sub") or T("approval_off_sub"),
-		c.restrict, true, function() do local nv = not (c.restrict) setPending("restrict", nv) ServerCall("server.setRestrict", nv) end end)
+	if toggleRow(rowTop(1), T("approval"), c.restrict and T("approval_on_sub") or T("approval_off_sub"),
+		c.restrict, true) then
+		send("restrict", "server.setRestrict", not c.restrict)
+	end
 
 	if button(T("allow_all"), -155, 72, 300, 26, GREEN, WHITE, 16, not c.restrict) then
 		ServerCall("server.setAllowedAll", true)
@@ -1788,7 +1871,7 @@ function TABS.players(c)
 
 	local players = GetAllPlayers()
 	local perPage = 3
-	local pages = math.max(1, math.ceil(#players / perPage))
+	local pages = max(1, math.ceil(#players / perPage))
 	K.page = clamp(K.page, 1, pages)
 	local first = (K.page - 1) * perPage
 
@@ -1823,12 +1906,12 @@ function TABS.players(c)
 
 		label(T("row_thrust"), LEFT, y2, 15, WHITE, 0.5, "left middle", 60)
 		if button("-", -228, y2, 28, 26, BTN, WHITE, 20) then stepMul(p, "thrust", oT, -MUL_STEP, MUL_T_MAX) end
-		label(oT .. "%", -190, y2, 17, mulColor(oT), 0.9, "center middle", 50)
+		label(oT .. "%", -190, y2, 17, oT ~= 100 and ACCENT or WHITE, 0.9, "center middle", 50)
 		if button("+", -152, y2, 28, 26, BTN, WHITE, 20) then stepMul(p, "thrust", oT, MUL_STEP, MUL_T_MAX) end
 
 		label(T("row_fuel"), -122, y2, 15, WHITE, 0.5, "left middle", 74)
 		if button("-", -30, y2, 28, 26, BTN, WHITE, 20) then stepMul(p, "fuel", oF, -MUL_STEP, MUL_F_MAX) end
-		label(oF .. "%", 10, y2, 17, mulColor(oF), 0.9, "center middle", 50)
+		label(oF .. "%", 10, y2, 17, oF ~= 100 and ACCENT or WHITE, 0.9, "center middle", 50)
 		if button("+", 50, y2, 28, 26, BTN, WHITE, 20) then stepMul(p, "fuel", oF, MUL_STEP, MUL_F_MAX) end
 
 		if button(T("reset"), 108, y2, 76, 26, BTN, WHITE, 15, oT == 100 and oF == 100) then
@@ -1894,12 +1977,50 @@ end
 
 local function resetHostSettings()
 	for _, key in ipairs({ "enabled", "announce", "hover", "smooth" }) do setPending(key, true) end
-	for _, key in ipairs({ "menuHidden", "hostFree", "restrict", "upgrades" }) do setPending(key, false) end
+	for _, key in ipairs({ "menuHidden", "hostFree", "restrict", "boostOn", "upgrades" }) do setPending(key, false) end
 	applyProfileHere("original")
 	setPending("refill", REFILL_DEFAULT)
 	setPending("delay", DELAY_DEFAULT)
 	setPending("ceiling", 0)
+	setPending("boostCd", BOOST_CD_DEFAULT)
+	setPending("boostCost", BOOST_COST_DEFAULT)
 	ServerCall("server.resetAll")
+end
+
+-- bottom action bar of the Admin tab
+local ACTIONS = {
+	{ id = "refill", text = "refill_all", needsFuel = true },
+	{ id = "overrides", text = "clear_overrides", multiplayer = true },
+	{ id = "stats", text = "reset_stats", armed = true },
+	{ id = "all", text = "reset_all", armed = true },
+}
+local actionLists = {}
+
+local function actionsFor(multiplayer)
+	local list = actionLists[multiplayer]
+	if list then return list end
+	list = {}
+	for _, a in ipairs(ACTIONS) do
+		if multiplayer or not a.multiplayer then list[#list + 1] = a end
+	end
+	actionLists[multiplayer] = list
+	return list
+end
+
+local function runAction(id)
+	if id == "refill" then
+		ServerCall("server.refillAll")
+		toast(T("toast_refilled"))
+	elseif id == "overrides" then
+		ServerCall("server.resetOverrides")
+		toast(T("toast_cleared"))
+	elseif id == "stats" then
+		ServerCall("server.resetStats")
+		toast(T("toast_stats_reset"))
+	elseif id == "all" then
+		resetHostSettings()
+		toast(T("toast_all_reset"))
+	end
 end
 
 function TABS.admin(c)
@@ -1910,9 +2031,8 @@ function TABS.admin(c)
 	local current = activeProfile(c)
 	for i, name in ipairs(PROFILE_BUTTONS) do
 		local active = (current == name)
-		local empty = (profileDef(name) == nil)
 		if button(T(PROFILE_LABEL[name]), (i - 3) * 120, 78, 112, 34,
-			active and ACCENT or BTN, active and DARK or WHITE, 17, empty) then
+			active and ACCENT or BTN, active and DARK or WHITE, 17, profileDef(name) == nil) then
 			applyProfileHere(name)
 			toast(T("toast_applied", T(PROFILE_LABEL[name])))
 		end
@@ -1926,56 +2046,36 @@ function TABS.admin(c)
 		end
 	end
 
-	toggleRow(138, T("host_free"), T("host_free_sub"), c.hostFree, true, function()
-		do local nv = not (c.hostFree) setPending("hostFree", nv) ServerCall("server.setHostFree", nv) end
-	end, c.fuelOn and 1 or 0.55)
+	if toggleRow(138, T("host_free"), T("host_free_sub"), c.hostFree, true, c.fuelOn and 1 or 0.55) then
+		send("hostFree", "server.setHostFree", not c.hostFree)
+	end
 
 	local y = 192
 	if c.multiplayer then
-		local hidden = pendingValue("menuHidden", shared.menuHidden == true)
-		toggleRow(192, T("menu_hidden"), T("menu_hidden_sub"), hidden, true, function()
-			do local nv = not (hidden) setPending("menuHidden", nv) ServerCall("server.setMenuHidden", nv) end
-		end)
-
-		local announce = pendingValue("announce", shared.announce ~= false)
-		toggleRow(246, T("announce"), T("announce_sub"), announce, true, function()
-			do local nv = not (announce) setPending("announce", nv) ServerCall("server.setAnnounce", nv) end
-		end)
+		if toggleRow(192, T("menu_hidden"), T("menu_hidden_sub"), c.menuHidden, true) then
+			send("menuHidden", "server.setMenuHidden", not c.menuHidden)
+		end
+		if toggleRow(246, T("announce"), T("announce_sub"), c.announce, true) then
+			send("announce", "server.setAnnounce", not c.announce)
+		end
 		y = 300
 	end
 
-	-- actions, spread evenly
-	local actions = {}
-	actions[#actions + 1] = { text = T("refill_all"), off = not c.fuelOn, run = function()
-		ServerCall("server.refillAll")
-		toast(T("toast_refilled"))
-	end }
-	if c.multiplayer then
-		actions[#actions + 1] = { text = T("clear_overrides"), run = function()
-			ServerCall("server.resetOverrides")
-			toast(T("toast_cleared"))
-		end }
-	end
-	actions[#actions + 1] = { text = T("reset_stats"), armed = "stats", run = function()
-		ServerCall("server.resetStats")
-		toast(T("toast_stats_reset"))
-	end }
-	actions[#actions + 1] = { text = T("reset_all"), armed = "all", run = function()
-		resetHostSettings()
-		toast(T("toast_all_reset"))
-	end }
-
-	local cy = y + 24
-	card(0, cy, CW, 48)
+	local actions = actionsFor(c.multiplayer)
 	local n = #actions
+	local cy = y + 24
 	local w = (CW - 24) / n - 8
+	card(0, cy, CW, 48)
 	for i, a in ipairs(actions) do
 		local x = -CW / 2 + 12 + (i - 0.5) * (CW - 24) / n
+		local text = T(a.text)
+		local clicked
 		if a.armed then
-			armedButton(a.armed, a.text, x, cy, w, 36, a.run)
-		elseif button(a.text, x, cy, w, 36, BTN, WHITE, 16, a.off) then
-			a.run()
+			clicked = armedButton(a.id, text, x, cy, w, 36)
+		else
+			clicked = button(text, x, cy, w, 36, BTN, WHITE, 16, a.needsFuel and not c.fuelOn)
 		end
+		if clicked then runAction(a.id) end
 	end
 end
 
@@ -1987,16 +2087,20 @@ local function resetPersonal()
 	setGaugeSize(2)
 	setGaugePos(1)
 	setGaugeColor(1)
-	setKbBind("jump")
-	setPadBind("jump")
+	local pad = usingPad()
+	setKbBind("jump", pad)
+	setPadBind("jump", pad)
+	setBoostKb("q", pad)
+	setBoostPad("interact", pad)
 	setFxMode(2)
-	setFlame(1)
-	setAccent(1, true)
+	setFlame(FLAME_DEFAULT)
+	setAccent(ACCENT_DEFAULT, true)
 	setQuickKey("")
 	setRememberTab(true)
 end
 
-local function keyPicker(cy, target, current, resetKey, resetText, onReset)
+-- keyboard key button + reset button. Returns true when reset was clicked.
+local function keyPicker(cy, target, current, resetKey, resetText)
 	local waiting = K.capturing and K.captureTarget == target
 	local text = waiting and T("press_key") or (current == "" and T("menu_key_none") or bindLabel(current))
 	if button(text, 134, cy, 170, 32, waiting and ACCENT or BTN, waiting and DARK or WHITE, 18) then
@@ -2004,123 +2108,97 @@ local function keyPicker(cy, target, current, resetKey, resetText, onReset)
 	end
 	if button(resetText, 260, cy, 70, 32, BTN, WHITE, 15, current == resetKey) then
 		K.capturing = false
-		onReset()
+		return true
 	end
+	return false
 end
 
-local function padPicker(cy, current, onSet)
-	if button("<", 77, cy, 40, 32, BTN, WHITE, 22) then onSet(cycleList(PAD_ACTIONS, current, -1)) end
-	if button(bindLabel(current), 176, cy, 150, 32, ACCENT, DARK, 18) then onSet(cycleList(PAD_ACTIONS, current, 1)) end
-	if button(">", 275, cy, 40, 32, BTN, WHITE, 22) then onSet(cycleList(PAD_ACTIONS, current, 1)) end
-end
-
-local function swatchRow(top, title, subtitle, palette, current, onPick, colorOf)
-	local cy = settingRow(top, title, subtitle, 200)
-	local n = #palette
-	for i = 1, n do
-		local x = RIGHT - 15 - (n - i) * 31
-		local c = colorOf(palette[i])
-		UiPush()
-			UiTranslate(x, cy)
-			UiAlign("center middle")
-			if i == current then
-				UiColor(1, 1, 1, 0.9)
-				UiRoundedRect(28, 28, 8)
-			end
-			UiColor(c[1], c[2], c[3], 1)
-			UiRoundedRect(23, 23, 6)
-		UiPop()
-		if hit(x, cy, 28, 28) then onPick(i) end
-	end
+-- controller action picker. Returns the newly chosen action, or nil.
+local function padPicker(cy, current)
+	local chosen
+	if button("<", 77, cy, 40, 32, BTN, WHITE, 22) then chosen = cycleList(PAD_ACTIONS, current, -1) end
+	if button(bindLabel(current), 176, cy, 150, 32, ACCENT, DARK, 18) then chosen = cycleList(PAD_ACTIONS, current, 1) end
+	if button(">", 275, cy, 40, 32, BTN, WHITE, 22) then chosen = cycleList(PAD_ACTIONS, current, 1) end
+	return chosen
 end
 
 -- Everything here only affects this player and is saved on this PC.
-function TABS.controls(c)
+function TABS.controls()
 	local pad = nav.active
+	local ba = (shared.boostOn == true) and 1 or 0.6
 
 	local cy = settingRow(rowTop(1), T("flight_key"), pad and T("key_sub_pad") or T("key_sub_kb"), 300)
-	if pad then padPicker(cy, K.pad, setPadBind)
-	else keyPicker(cy, "fly", K.kb, "jump", T("reset"), function() setKbBind("jump") end) end
-
-	cy = settingRow(rowTop(2), T("menu_key"), T("menu_key_sub"), 300)
 	if pad then
-		label(T("kb_only"), RIGHT, cy, 18, WHITE, 0.5, "right middle", 200)
-	else
-		keyPicker(cy, "menu", K.quickKey, "", T("clear"), function() setQuickKey("") end)
+		local v = padPicker(cy, K.pad)
+		if v then setPadBind(v, true) end
+	elseif keyPicker(cy, "fly", K.kb, "jump", T("reset")) then
+		setKbBind("jump", false)
 	end
 
-	choiceRow(rowTop(3), T("effects"), T("effects_sub"), { "fx_off", "fx_light", "fx_full" },
-		pendingValue("fx", K.fx + 1), true, function(i)
-			setPending("fx", i)
-			setFxMode(i - 1)
-		end)
+	cy = settingRow(rowTop(2), T("boost_key"), T("boost_key_sub"), 300, ba)
+	if pad then
+		local v = padPicker(cy, K.boostPad)
+		if v then setBoostPad(v, true) end
+	elseif keyPicker(cy, "boost", K.boostKb, "q", T("reset")) then
+		setBoostKb("q", false)
+	end
 
-	choiceRow(rowTop(4), T("flame"), T("flame_sub"), FLAME_KEYS, pendingValue("flame", K.flame), true, function(i)
-		setPending("flame", i)
-		setFlame(i)
-	end)
+	cy = settingRow(rowTop(3), T("menu_key"), T("menu_key_sub"), 300)
+	if pad then
+		label(T("kb_only"), RIGHT, cy, 18, WHITE, 0.5, "right middle", 200)
+	elseif keyPicker(cy, "menu", K.quickKey, "", T("clear")) then
+		setQuickKey("")
+	end
 
-	swatchRow(rowTop(5), T("accent"), T("accent_sub"), ACCENT_PALETTE, K.accent,
-		function(i) setAccent(i, true) end, function(col) return col end)
+	local pick = choiceRow(rowTop(4), T("effects"), T("effects_sub"), { "fx_off", "fx_light", "fx_full" }, K.fx + 1, true)
+	if pick then setFxMode(pick - 1) end
 
-	toggleRow(rowTop(6), T("last_tab"), T("last_tab_sub"), K.remember, true, function()
+	pick = choiceRow(rowTop(5), T("flame"), T("flame_sub"), FLAME_KEYS, K.flame, true)
+	if pick then setFlame(pick) end
+
+	pick = swatchRow(rowTop(6), T("accent"), T("accent_sub"), ACCENT_PALETTE, K.accent)
+	if pick then setAccent(pick, true) end
+
+	if toggleRow(rowTop(7), T("last_tab"), T("last_tab_sub"), K.remember, true) then
 		setRememberTab(not K.remember)
-	end)
+	end
 
-	cy = settingRow(rowTop(7), T("reset_personal"), T("reset_personal_sub"), 330)
-	armedButton("personal", T("reset"), RIGHT - 90, cy, 180, 32, function()
+	cy = settingRow(rowTop(8), T("reset_personal"), T("reset_personal_sub"), 330)
+	if armedButton("personal", T("reset"), RIGHT - 90, cy, 180, 32) then
 		resetPersonal()
 		toast(T("toast_personal_reset"))
-	end)
+	end
 end
 
-function TABS.hud(c)
-	local autoHide = pendingValue("gauge", K.autoHide)
-	toggleRow(rowTop(1), T("gauge"), T("gauge_sub"), autoHide, true, function()
-		setPending("gauge", not autoHide)
-		setGaugeAutoHide(not autoHide)
-	end)
+function TABS.hud()
+	if toggleRow(rowTop(1), T("gauge"), T("gauge_sub"), K.autoHide, true) then setGaugeAutoHide(not K.autoHide) end
+	if toggleRow(rowTop(2), T("speed_hud"), T("speed_hud_sub"), K.speedHud, true) then setSpeedHud(not K.speedHud) end
+	if toggleRow(rowTop(3), T("alt_hud"), T("alt_hud_sub"), K.altHud, true) then setAltHud(not K.altHud) end
 
-	local showSpeed = pendingValue("speedhud", K.speedHud)
-	toggleRow(rowTop(2), T("speed_hud"), T("speed_hud_sub"), showSpeed, true, function()
-		setPending("speedhud", not showSpeed)
-		setSpeedHud(not showSpeed)
-	end)
+	local pick = choiceRow(rowTop(4), T("speed_unit"), nil, SPEED_UNIT_KEYS, K.speedUnit, true, K.speedHud and 1 or 0.5)
+	if pick then setSpeedUnit(pick) end
 
-	local showAlt = pendingValue("althud", K.altHud)
-	toggleRow(rowTop(3), T("alt_hud"), T("alt_hud_sub"), showAlt, true, function()
-		setPending("althud", not showAlt)
-		setAltHud(not showAlt)
-	end)
+	pick = choiceRow(rowTop(5), T("gauge_size"), nil, { "size_s", "size_m", "size_l" }, K.gaugeSize, true)
+	if pick then setGaugeSize(pick) end
 
-	choiceRow(rowTop(4), T("speed_unit"), nil, SPEED_UNIT_KEYS, pendingValue("sunit", K.speedUnit), true, function(i)
-		setPending("sunit", i)
-		setSpeedUnit(i)
-	end, showSpeed and 1 or 0.5)
+	pick = choiceRow(rowTop(6), T("gauge_pos"), nil, { "pos_bottom", "pos_top", "pos_left", "pos_right" }, K.gaugePos, true)
+	if pick then setGaugePos(pick) end
 
-	choiceRow(rowTop(5), T("gauge_size"), nil, { "size_s", "size_m", "size_l" },
-		pendingValue("gsize", K.gaugeSize), true, function(i)
-			setPending("gsize", i)
-			setGaugeSize(i)
-		end)
-
-	choiceRow(rowTop(6), T("gauge_pos"), nil, { "pos_bottom", "pos_top", "pos_left", "pos_right" },
-		pendingValue("gpos", K.gaugePos), true, function(i)
-			setPending("gpos", i)
-			setGaugePos(i)
-		end)
-
-	choiceRow(rowTop(7), T("gauge_color"), nil, GAUGE_KEYS, pendingValue("gcol", K.gaugeColor), true, function(i)
-		setPending("gcol", i)
-		setGaugeColor(i)
-	end)
+	pick = choiceRow(rowTop(7), T("gauge_color"), nil, GAUGE_KEYS, K.gaugeColor, true)
+	if pick then setGaugeColor(pick) end
 end
 
 
 -- settings window ---------------------------------------------------------------------------
 
+local tabCache = {}
+
 local function buildTabs(isHost, multiplayer)
-	local tabs = {
+	local cacheKey = (isHost and 1 or 0) + (multiplayer and 2 or 0)
+	local tabs = tabCache[cacheKey]
+	if tabs then return tabs end
+
+	tabs = {
 		{ id = "flight", name = T("tab_flight"), section = "sec_game" },
 		{ id = "fuel", name = T("tab_fuel"), section = "sec_game" },
 	}
@@ -2133,6 +2211,7 @@ local function buildTabs(isHost, multiplayer)
 	tabs[#tabs + 1] = { id = "controls", name = T("tab_controls"), section = "sec_you" }
 	tabs[#tabs + 1] = { id = "hud", name = T("tab_hud"), section = "sec_you" }
 	tabs[#tabs + 1] = { id = "stats", name = T("tab_stats"), section = "sec_you" }
+	tabCache[cacheKey] = tabs
 	return tabs
 end
 
@@ -2213,14 +2292,13 @@ local function drawWindow()
 	nav.active = usingPad()
 	nav.accept = nav.active and InputPressed("menu_accept") and GetTime() - K.openedAt > 0.2
 	nav.items = {}
-	nav.offset = 0
-	nav.offsetY = 0
 
+	local jetting = shared.jetting
 	local c = {
 		isHost = isHost,
 		multiplayer = multiplayer,
 		playerCount = playerCount,
-		flyingCount = type(shared.jetting) == "table" and #shared.jetting or 0,
+		flyingCount = type(jetting) == "table" and #jetting or 0,
 		enabled = pendingValue("enabled", shared.enabled ~= false),
 		thrust = pendingValue("thrust", shared.thrustPct or THRUST_DEFAULT),
 		smooth = pendingValue("smooth", shared.smooth ~= false),
@@ -2230,17 +2308,22 @@ local function drawWindow()
 		refill = pendingValue("refill", shared.refill or REFILL_DEFAULT),
 		refillDelay = pendingValue("delay", shared.refillDelay or DELAY_DEFAULT),
 		hover = pendingValue("hover", shared.hover ~= false),
+		boostOn = pendingValue("boostOn", shared.boostOn == true),
+		boostCd = pendingValue("boostCd", shared.boostCd or BOOST_CD_DEFAULT),
+		boostCost = pendingValue("boostCost", shared.boostCost or BOOST_COST_DEFAULT),
 		upgrades = pendingValue("upgrades", shared.upgrades == true),
 		ceiling = pendingValue("ceiling", shared.ceiling or 0),
 		hostFree = pendingValue("hostFree", shared.hostFree == true),
 		restrict = pendingValue("restrict", shared.restrict == true),
+		menuHidden = pendingValue("menuHidden", shared.menuHidden == true),
+		announce = pendingValue("announce", shared.announce ~= false),
 		blocked = (shared.restrict == true) and not isHost and not inAllowedList(me),
 	}
 
 	local tabs = buildTabs(isHost, multiplayer)
 	local known = false
 	for i = 1, #tabs do
-		if tabs[i].id == K.tab then known = true end
+		if tabs[i].id == K.tab then known = true break end
 	end
 	if not known then K.tab = "flight" end
 	if K.tab ~= K.lastTab then
@@ -2253,7 +2336,7 @@ local function drawWindow()
 		UiRect(UiWidth(), UiHeight())
 
 		UiTranslate(UiCenter(), UiMiddle())
-		local fit = math.min(1, (UiHeight() - 24) / PANEL_H, (UiWidth() - 24) / PANEL_W)
+		local fit = min(1, (UiHeight() - 24) / PANEL_H, (UiWidth() - 24) / PANEL_W)
 		if fit < 1 then UiScale(fit) end
 		UiAlign("center middle")
 
@@ -2264,19 +2347,18 @@ local function drawWindow()
 		UiColor(PANEL[1], PANEL[2], PANEL[3], 0.98)
 		UiRoundedRect(PANEL_W, PANEL_H, 20)
 
+		nav.offset, nav.offsetY = 0, 0
 		drawHeader(c)
 		drawSidebar(tabs)
 
 		UiPush()
 			UiTranslate(CONTENT_X, BODY_TOP)
-			nav.offset = CONTENT_X
-			nav.offsetY = BODY_TOP
-			local drawTab = TABS[K.tab] or TABS.flight
-			local ok, err = pcall(drawTab, c)      -- a broken tab never takes the whole menu down
+			nav.offset, nav.offsetY = CONTENT_X, BODY_TOP
+			-- a broken tab never takes the whole menu down
+			local ok, err = pcall(TABS[K.tab] or TABS.flight, c)
 			if not ok then label("Tab error: " .. tostring(err), 0, 40, 16, BAD, 1, "center middle", CW - 20) end
 		UiPop()
-		nav.offset = 0
-		nav.offsetY = 0
+		nav.offset, nav.offsetY = 0, 0
 
 		drawFooter(isHost)
 	UiPop()
@@ -2286,18 +2368,13 @@ local function drawWindow()
 end
 
 function client.draw()
-	if not K.accentLoaded then
-		K.accentLoaded = true
-		setAccent(GetInt("savegame.mod.accent"), false)
-	end
-
 	if not K.open then
 		if shared.fuelEnabled then drawGauge() end
 		if K.speedHud or K.altHud then drawSpeed() end
+		drawBoost()
 		drawNote()
 		return
 	end
-
 	drawWindow()
 end
 
