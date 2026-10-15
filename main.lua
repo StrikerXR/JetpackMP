@@ -15,7 +15,7 @@
 --     which could stop the script loading and made every toggle say the
 --     server function was not recognized.
 --   * Server calls are wrapped so a bad call can never crash the menu.
---   * Fuel & Boost tab simplified, single player gets its own wording and
+--   * Fuel tab simplified, single player gets its own wording and
 --     hides host-only options.
 --   * More colours: 10 accent colours, 5 flame colours, 5 gauge colours.
 --   * Every setting from 28.3 is still here and keeps its saved name.
@@ -43,9 +43,6 @@ local BIND_RESEND = 3
 local GAUGE_HIDE_DELAY = 3
 local GAUGE_FADE_RATE = 6
 
-local BOOST_TIME, BOOST_MUL = 0.4, 2.6
-local BOOST_CD_MIN, BOOST_CD_MAX, BOOST_CD_DEFAULT = 3, 30, 8
-local BOOST_COST_MAX, BOOST_COST_STEP, BOOST_COST_DEFAULT = 5, 0.5, 1.5
 local MUL_MIN, MUL_STEP, MUL_T_MAX, MUL_F_MAX = 25, 25, 200, 400
 
 
@@ -79,8 +76,6 @@ local function clampCeiling(v)
 end
 
 local function clampMul(v, hi) return clamp(snap(num(v, 100), MUL_STEP), MUL_MIN, hi) end
-local function clampBoostCd(v) return clamp(math.floor(num(v, BOOST_CD_DEFAULT) + 0.5), BOOST_CD_MIN, BOOST_CD_MAX) end
-local function clampBoostCost(v) return clamp(snap(num(v, BOOST_COST_DEFAULT), BOOST_COST_STEP), 0, BOOST_COST_MAX) end
 
 local PROFILES = {
 	original = { thrust = 100, cap = 0,  smooth = true,  fuel = false, tank = FUEL_DEFAULT },
@@ -189,15 +184,15 @@ local S = {
 	on = true, thrust = THRUST_DEFAULT, cap = 0, smooth = true,
 	restrict = false, fuelOn = false, tank = FUEL_DEFAULT, refill = REFILL_DEFAULT,
 	delay = DELAY_DEFAULT, ceiling = 0, hostFree = false,
-	hover = true, boostOn = false, boostCd = BOOST_CD_DEFAULT, boostCost = BOOST_COST_DEFAULT,
+	hover = true,
 	upgrades = false, menuHidden = false, announce = true,
 	noteSeq = 0, playerCount = 0, errorShown = false,
 	fuelTimer = 0, statsTimer = 0, saveTimer = 0,
-	lastJetting = {}, lastBoosting = {}, lastFuelValues = {}, lastStats = {},
+	lastJetting = {}, lastFuelValues = {}, lastStats = {},
 }
 local R = {
-	allowed = {}, binds = {}, boostBinds = {}, fuel = {}, ramp = {}, baseY = {}, groundedFor = {},
-	ovT = {}, ovF = {}, boostCdT = {}, boostLeft = {}, boostPrev = {},
+	allowed = {}, binds = {}, fuel = {}, ramp = {}, baseY = {}, groundedFor = {},
+	ovT = {}, ovF = {},
 	stats = {}, airborne = {}, lastX = {}, lastZ = {},
 }
 
@@ -264,7 +259,7 @@ local function statsFor(p)
 	s = {
 		key = key, dirty = false,
 		peak = GetInt(key .. ".peak"), dist = GetInt(key .. ".dist"),
-		time = GetInt(key .. ".time"), boosts = GetInt(key .. ".boosts"),
+		time = GetInt(key .. ".time"),
 	}
 	R.stats[p] = s
 	return s
@@ -276,7 +271,6 @@ local function saveStat(s)
 	SetInt(s.key .. ".peak", math.floor(s.peak))
 	SetInt(s.key .. ".dist", math.floor(s.dist))
 	SetInt(s.key .. ".time", math.floor(s.time))
-	SetInt(s.key .. ".boosts", s.boosts)
 end
 
 local function publishStats(force)
@@ -289,7 +283,6 @@ local function publishStats(force)
 			list[i + 2] = math.floor(s.peak)
 			list[i + 3] = math.floor(s.dist)
 			list[i + 4] = math.floor(s.time)
-			list[i + 5] = s.boosts
 		end
 	end
 	if force or not sameList(list, S.lastStats) then
@@ -347,13 +340,6 @@ function server.init()
 	S.ceiling = clampCeiling(GetInt("savegame.mod.ceiling"))
 
 	S.hover = GetInt("savegame.mod.hover_off") ~= 1
-	S.boostOn = GetInt("savegame.mod.boost_on") == 1
-	local savedCd = GetInt("savegame.mod.boost_cd")
-	if savedCd > 0 then S.boostCd = clampBoostCd(savedCd) end
-	local savedCost = GetInt("savegame.mod.boost_cost_x10")
-	if savedCost > 0 or GetInt("savegame.mod.boost_cost_set") == 1 then
-		S.boostCost = clampBoostCost(savedCost / 10)
-	end
 	S.upgrades = GetInt("savegame.mod.upgrades_on") == 1
 
 	for slot = 1, 2 do
@@ -387,11 +373,7 @@ function server.init()
 	shared.restrict = false
 	shared.allowed = {}
 	shared.jetting = {}
-	shared.boosting = {}
 	shared.hover = S.hover
-	shared.boostOn = S.boostOn
-	shared.boostCd = S.boostCd
-	shared.boostCost = S.boostCost
 	shared.upgrades = S.upgrades
 	shared.pm = {}
 	shared.ps = {}
@@ -549,7 +531,7 @@ end
 function server.resetStats()
 	for _, p in ipairs(GetAllPlayers()) do
 		local s = statsFor(p)
-		s.peak, s.dist, s.time, s.boosts = 0, 0, 0, 0
+		s.peak, s.dist, s.time = 0, 0, 0
 		s.dirty = true
 		saveStat(s)
 	end
@@ -561,26 +543,6 @@ function server.setHover(on)
 	S.hover = on and true or false
 	shared.hover = S.hover
 	SetInt("savegame.mod.hover_off", S.hover and 0 or 1)
-end
-
-function server.setBoostOn(on)
-	S.boostOn = on and true or false
-	shared.boostOn = S.boostOn
-	SetInt("savegame.mod.boost_on", S.boostOn and 1 or 0)
-	notify(S.boostOn and "Host turned boost on" or "Host turned boost off")
-end
-
-function server.setBoostCd(seconds)
-	S.boostCd = clampBoostCd(seconds)
-	shared.boostCd = S.boostCd
-	SetInt("savegame.mod.boost_cd", S.boostCd)
-end
-
-function server.setBoostCost(seconds)
-	S.boostCost = clampBoostCost(seconds)
-	shared.boostCost = S.boostCost
-	SetInt("savegame.mod.boost_cost_x10", math.floor(S.boostCost * 10 + 0.5))
-	SetInt("savegame.mod.boost_cost_set", 1)
 end
 
 function server.setUpgrades(on)
@@ -641,9 +603,6 @@ function server.resetAll()
 	server.setCeiling(0)
 	server.setHostFree(false)
 	server.setHover(true)
-	server.setBoostOn(false)
-	server.setBoostCd(BOOST_CD_DEFAULT)
-	server.setBoostCost(BOOST_COST_DEFAULT)
 	server.setUpgrades(false)
 	R.ovT, R.ovF = {}, {}
 	publishMuls()
@@ -652,12 +611,10 @@ function server.resetAll()
 	notify("Host reset all Jetpack settings")
 end
 
-function server.setPlayerBind(pid, bind, boostBind)
+function server.setPlayerBind(pid, bind)
 	if type(pid) ~= "number" or not IsPlayerValid(pid) then return end
 	bind = normalizeBind(bind)
 	if bind then R.binds[pid] = bind end
-	boostBind = normalizeBind(boostBind)
-	if boostBind then R.boostBinds[pid] = boostBind end
 end
 
 function server.tick(dt)
@@ -671,7 +628,7 @@ function server.tick(dt)
 end
 
 -- One player, one physics step. Split out so stepPlayers stays small.
-local function stepOne(p, dt, flying, boosting)
+local function stepOne(p, dt, flying)
 	local s = statsFor(p)
 	local health = GetPlayerHealth(p)
 	local inVehicle = GetPlayerVehicle(p) ~= 0
@@ -701,21 +658,6 @@ local function stepOne(p, dt, flying, boosting)
 	local ceilRoom = nil
 	if S.ceiling > 0 then ceilRoom = S.ceiling - (pos[2] - R.baseY[p]) end
 
-	-- Boost: rising edge on the boost key while flying, once the cooldown is over.
-	local boostHeld = S.boostOn and inputHeld(R.boostBinds[p] or "q", p) or false
-	R.boostCdT[p] = math.max(0, (R.boostCdT[p] or 0) - dt)
-	if flyingNow and boostHeld and not R.boostPrev[p] and R.boostCdT[p] <= 0 then
-		local affordable = not S.fuelOn or free or S.boostCost <= 0 or fuel[p] >= S.boostCost
-		if affordable then
-			R.boostLeft[p] = BOOST_TIME
-			R.boostCdT[p] = S.boostCd
-			if S.fuelOn and not free then fuel[p] = math.max(0, fuel[p] - S.boostCost) end
-			s.boosts = s.boosts + 1
-			s.dirty = true
-		end
-	end
-	R.boostPrev[p] = boostHeld
-
 	if flyingNow then
 		R.groundedFor[p] = 0
 		R.ramp[p] = (R.ramp[p] or 0) + dt
@@ -723,21 +665,15 @@ local function stepOne(p, dt, flying, boosting)
 		s.dirty = true
 
 		local power = S.smooth and rampPower(R.ramp[p]) or 1
-		local boostK, capK = 1, 1
-		if (R.boostLeft[p] or 0) > 0 then
-			R.boostLeft[p] = R.boostLeft[p] - dt
-			boostK, capK, power = BOOST_MUL, 1.5, 1
-			boosting[#boosting + 1] = p
-		end
 
-		local t = THRUST_BASE * S.thrust / 100 * thrustMul * power * boostK
+		local t = THRUST_BASE * S.thrust / 100 * thrustMul * power
 		local vel = GetPlayerVelocity(p)
 		local push = TransformToParentVec(GetPlayerCameraTransform(p), Vec(0, t, 0))
 
 		local assist = S.hover and inputHeld("crouch", p)
 		if assist then push = Vec(push[1], 0, push[3]) end
 
-		local newVel = capSpeed(vel, VecAdd(vel, push), S.cap * capK)
+		local newVel = capSpeed(vel, VecAdd(vel, push), S.cap)
 		if assist then
 			-- Pull vertical speed towards what cancels the next step of gravity.
 			local vy = newVel[2]
@@ -752,7 +688,6 @@ local function stepOne(p, dt, flying, boosting)
 		if S.fuelOn and not free then fuel[p] = math.max(0, fuel[p] - dt / endurance) end
 	else
 		R.ramp[p] = math.max(0, (R.ramp[p] or 0) - dt * 3)
-		R.boostLeft[p] = 0
 		if grounded then R.groundedFor[p] = (R.groundedFor[p] or 0) + dt else R.groundedFor[p] = 0 end
 		if S.fuelOn and grounded and R.groundedFor[p] >= S.delay then
 			fuel[p] = math.min(S.tank, fuel[p] + dt * S.tank / S.refill * refillMul)
@@ -774,10 +709,10 @@ local function stepOne(p, dt, flying, boosting)
 end
 
 local function stepPlayers(dt)
-	local flying, boosting = {}, {}
+	local flying = {}
 	for _, p in ipairs(GetAllPlayers()) do
 		-- one broken player can never stop the others
-		local ok, err = pcall(stepOne, p, dt, flying, boosting)
+		local ok, err = pcall(stepOne, p, dt, flying)
 		if not ok and not S.errorShown then
 			S.errorShown = true
 			DebugPrint("Jetpack (Multiplayer) error: " .. tostring(err))
@@ -787,10 +722,6 @@ local function stepPlayers(dt)
 	if not sameList(flying, S.lastJetting) then
 		shared.jetting = flying
 		S.lastJetting = flying
-	end
-	if not sameList(boosting, S.lastBoosting) then
-		shared.boosting = boosting
-		S.lastBoosting = boosting
 	end
 
 	if S.fuelOn then
@@ -838,7 +769,7 @@ local STRINGS = {
 
 	sec_game = "Game", sec_host = "Host tools", sec_you = "You",
 	sec_game_sp = "Jetpack", sec_host_sp = "Tools", sec_you_sp = "Personal",
-	tab_flight = "Flight", tab_fuel = "Fuel & Boost", tab_players = "Players", tab_admin = "Admin",
+	tab_flight = "Flight", tab_fuel = "Fuel", tab_players = "Players", tab_admin = "Admin",
 	tab_admin_sp = "Tools",
 	tab_controls = "Controls", tab_hud = "HUD", tab_stats = "Stats",
 
@@ -855,9 +786,6 @@ local STRINGS = {
 	tank = "Tank size", tank_sub = "How many seconds you can fly",
 	refill_time = "Refill speed", refill_time_sub = "Seconds to fill an empty tank",
 	refill_delay = "Refill wait", refill_delay_sub = "Seconds on the ground before refilling starts",
-	boost = "Boost", boost_sub = "Press the boost key while flying for a quick burst",
-	boost_cd = "Boost cooldown", boost_cd_sub = "Seconds before you can boost again",
-	boost_cost = "Boost fuel cost", boost_cost_sub = "Fuel used per boost (needs Fuel on)",
 	upgrades = "Upgrades", upgrades_sub = "Fly more to unlock bigger tank, thrust and refill",
 	upgrades_sub_sp = "Fly more to unlock a bigger tank, thrust and refill",
 
@@ -888,8 +816,7 @@ local STRINGS = {
 	key_sub_kb = "Click the button, then press a key",
 	key_sub_pad = "Pick the action that makes you fly",
 	press_key = "Press a key...", clear = "Clear", kb_only = "Keyboard only",
-	key_in_use = "That key is already used for flying or boost",
-	boost_key = "Boost key", boost_key_sub = "Press it while flying for a short burst",
+	key_in_use = "That key is already used for flying",
 	menu_key = "Menu key", menu_key_sub = "Open and close this menu without pausing", menu_key_none = "Not set",
 	effects = "Exhaust effects", effects_sub = "Flames and smoke behind jetpacks",
 	fx_off = "Off", fx_light = "Flames", fx_full = "Full",
@@ -912,14 +839,14 @@ local STRINGS = {
 
 	stat_peak = "PEAK HEIGHT", stat_peak_sub = "above take-off",
 	stat_dist = "DISTANCE FLOWN", stat_dist_sub = "all time",
-	stat_time = "FLIGHT TIME", stat_boosts = "%d boosts",
-	up_title = "Upgrades", up_off = "Off - turn them on under Fuel & Boost",
+	stat_time = "FLIGHT TIME",
+	up_title = "Upgrades", up_off = "Off - turn them on under Fuel",
 	up_tier = "Tier %d   +%d%%", up_locked = "Locked", up_max = "MAX",
 	pilots = "Pilots", pilots_more = "Pilots (+%d more)",
 	col_peak = "PEAK", col_dist = "DISTANCE", col_time = "TIME",
 
 	hud_fuel = "FUEL  %.1fs", hud_empty = "FUEL EMPTY",
-	boost_ready = "BOOST READY", boost_wait = "BOOST  %ds", alt_value = "ALT %d m",
+	alt_value = "ALT %d m",
 
 	act_jump = "Jump", act_crouch = "Crouch", act_interact = "Interact",
 	act_flashlight = "Flashlight", act_grab = "Grab", act_usetool = "Use tool",
@@ -930,13 +857,13 @@ local STRINGS = {
 -- client state, all in one table
 local K = {
 	sp = false, open = false, openedAt = 0, tab = "flight", lastTab = "flight", remember = true,
-	quickKey = "", kb = "jump", pad = "jump", boostKb = "q", boostPad = "interact",
+	quickKey = "", kb = "jump", pad = "jump",
 	capturing = false, captureTarget = "fly", captureStart = 0, bindTimer = BIND_RESEND, wasPad = false,
 	localFuel = nil, lastFuelOn = false,
 	autoHide = true, gaugeAlpha = 1, groundTime = 0, gaugeSize = 2, gaugePos = 1, gaugeColor = 1,
 	speedHud = false, speedShown = 0, speedUnit = 1, altHud = false, altShown = 0, altGroundY = nil,
 	fx = 2, flame = 1, toastText = "", toastUntil = 0, noteText = "", noteUntil = 0, lastNoteSeq = nil,
-	boostCd = 0, wasBoosting = false, page = 1, armedId = nil, armedUntil = 0,
+	page = 1, armedId = nil, armedUntil = 0,
 	accent = 1, accentLoaded = false, snd = 0,
 }
 
@@ -991,9 +918,9 @@ end
 
 local function getStats(pid)
 	local list = shared.ps
-	local i = listIndex(list, 5, pid)
-	if i then return list[i + 1], list[i + 2], list[i + 3], list[i + 4] end
-	return 0, 0, 0, 0
+	local i = listIndex(list, 4, pid)
+	if i then return list[i + 1], list[i + 2], list[i + 3] end
+	return 0, 0, 0
 end
 
 local function fuelMultipliers(pid)
@@ -1029,7 +956,7 @@ end
 local function sendBind()
 	K.bindTimer = 0
 	local pad = usingPad()
-	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb)
+	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb)
 end
 
 local function activeBind() return usingPad() and K.pad or K.kb end
@@ -1087,8 +1014,6 @@ local BAD    = { 0.90, 0.45, 0.45 }
 
 local function setKbBind(v) K.kb = v SetString("savegame.mod.flykey", v) sendBind() end
 local function setPadBind(v) K.pad = v SetString("savegame.mod.padkey", v) sendBind() end
-local function setBoostKb(v) K.boostKb = v SetString("savegame.mod.boostkey", v) sendBind() end
-local function setBoostPad(v) K.boostPad = v SetString("savegame.mod.boostpadkey", v) sendBind() end
 local function setGaugeAutoHide(on) K.autoHide = on and true or false SetInt("savegame.mod.hudautohideoff", K.autoHide and 0 or 1) end
 local function setSpeedHud(on) K.speedHud = on and true or false SetInt("savegame.mod.speedhud", K.speedHud and 1 or 0) end
 local function setSpeedUnit(v) K.speedUnit = SPEED_FACTOR[v] and v or 1 SetInt("savegame.mod.speed_unit", K.speedUnit) end
@@ -1114,10 +1039,8 @@ local function pollCapture()
 	K.capturing = false
 	if key == "esc" then return end
 	if VALID_INPUTS[key] then
-		if K.captureTarget == "boost" then
-			setBoostKb(key)
-		elseif K.captureTarget == "menu" then
-			if key == K.kb or key == K.boostKb then
+		if K.captureTarget == "menu" then
+			if key == K.kb then
 				K.toastText, K.toastUntil = T("key_in_use"), GetTime() + 3
 			else
 				setQuickKey(key)
@@ -1161,29 +1084,24 @@ end
 
 local function jitter(amount) return GetRandomFloat(-amount, amount) end
 
-local function spawnExhaust(player, mode, boosted)
+local function spawnExhaust(player, mode)
 	local t = GetPlayerTransform(player)
 	local origin = TransformToParentPoint(t, Vec(0, 0.85, 0.3))
 	local carry = VecScale(GetPlayerVelocity(player), 0.5)
 	local f = FLAME_PALETTE[K.flame] or FLAME_PALETTE[1]
 
-	for i = 1, boosted and 5 or 2 do
+	for i = 1, 2 do
 		ParticleReset()
 		ParticleType("plain")
 		ParticleTile(5)
-		if boosted then
-			ParticleColor(math.min(1, f[1] + 0.3), math.min(1, f[2] + 0.3), math.min(1, f[3] + 0.3), f[4], f[5], f[6])
-			ParticleRadius(0.13, 0.03, "easeout")
-		else
-			ParticleColor(f[1], f[2], f[3], f[4], f[5], f[6])
-			ParticleRadius(0.07, 0.02, "easeout")
-		end
+		ParticleColor(f[1], f[2], f[3], f[4], f[5], f[6])
+		ParticleRadius(0.07, 0.02, "easeout")
 		ParticleAlpha(1.0, 0.0, "easeout", 0, 0.4)
 		ParticleEmissive(6, 0, "easeout")
 		ParticleGravity(0)
 		ParticleDrag(0.2)
 		ParticleCollide(0)
-		SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.4), (boosted and -6 or -3.5) + jitter(0.5), jitter(0.4))), 0.3)
+		SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.4), -3.5 + jitter(0.5), jitter(0.4))), 0.3)
 	end
 
 	if mode < 2 then return end
@@ -1197,7 +1115,7 @@ local function spawnExhaust(player, mode, boosted)
 	ParticleDrag(0.4)
 	SpawnParticle(origin, VecAdd(carry, Vec(jitter(0.3), -1.8, jitter(0.3))), 1.2)
 
-	PointLight(VecAdd(origin, Vec(0, -0.4, 0)), f[4], (f[5] + f[2]) / 2, f[6], boosted and 5 or 2.5)
+	PointLight(VecAdd(origin, Vec(0, -0.4, 0)), f[4], (f[5] + f[2]) / 2, f[6], 2.5)
 end
 
 function client.init()
@@ -1207,11 +1125,6 @@ function client.init()
 	if v then K.kb = v end
 	local pad = GetString("savegame.mod.padkey")
 	if PAD_VALID[pad] then K.pad = pad end
-	v = normalizeBind(GetString("savegame.mod.boostkey"))
-	if v then K.boostKb = v end
-	pad = GetString("savegame.mod.boostpadkey")
-	if PAD_VALID[pad] then K.boostPad = pad end
-
 	K.autoHide = GetInt("savegame.mod.hudautohideoff") ~= 1
 	K.speedHud = GetInt("savegame.mod.speedhud") == 1
 	local unit = GetInt("savegame.mod.speed_unit")
@@ -1293,11 +1206,7 @@ function client.tick(dt)
 		end
 	end
 
-	local boostingList = shared.boosting
-	local meBoosting = listHas(boostingList, me)
-	if meBoosting and not K.wasBoosting then K.boostCd = shared.boostCd or BOOST_CD_DEFAULT end
-	K.wasBoosting = meBoosting
-	K.boostCd = math.max(0, K.boostCd - dt)
+
 
 	local wantsToFly = localCanFly() and health > 0 and not inVehicle and inputHeld(activeBind())
 	local flying = wantsToFly and (not fuelOn or K.localFuel > 0.02)
@@ -1327,7 +1236,7 @@ function client.tick(dt)
 
 	if flying then
 		PlayLoop(K.snd, GetCameraTransform().pos, SOUND_VOLUME)
-		if K.fx > 0 then pcall(spawnExhaust, me, K.fx, meBoosting) end
+		if K.fx > 0 then pcall(spawnExhaust, me, K.fx) end
 	end
 
 	local others = shared.jetting
@@ -1336,7 +1245,7 @@ function client.tick(dt)
 			local p = others[i]
 			if p ~= me and IsPlayerValid(p) then
 				PlayLoop(K.snd, GetPlayerTransform(p).pos, SOUND_VOLUME)
-				if K.fx > 0 then pcall(spawnExhaust, p, K.fx, listHas(boostingList, p)) end
+				if K.fx > 0 then pcall(spawnExhaust, p, K.fx) end
 			end
 		end
 	end
@@ -1589,31 +1498,6 @@ local function drawSpeed()
 	end
 end
 
-local function drawBoost()
-	local me = GetLocalPlayer()
-	if shared.boostOn ~= true or not localCanFly() then return end
-	if GetPlayerHealth(me) <= 0 or GetPlayerVehicle(me) ~= 0 then return end
-
-	local ax, ay, s, top = gaugeAnchor()
-	local dir = top and -1 or 1
-	local y = ay + dir * 24 * s
-	local total = math.max(1, shared.boostCd or BOOST_CD_DEFAULT)
-	local ready = K.boostCd <= 0
-	local frac = ready and 1 or (1 - K.boostCd / total)
-	local c = ready and (GOOD) or { 0.6, 0.6, 0.65 }
-
-	UiPush()
-		UiTranslate(ax - 50 * s, y)
-		UiAlign("left middle")
-		UiColor(1, 1, 1, 0.12)
-		UiRoundedRect(100 * s, 5 * s, 2.5 * s)
-		UiColor(c[1], c[2], c[3], 0.9)
-		UiRoundedRect(math.max(100 * s * frac, 5 * s), 5 * s, 2.5 * s)
-	UiPop()
-	label(ready and T("boost_ready") or T("boost_wait", math.ceil(K.boostCd)),
-		ax, y + dir * 11 * s, math.floor(12 * s), c, ready and 0.9 or 0.65)
-end
-
 local function drawNote()
 	local now = GetTime()
 	if now >= K.noteUntil or K.noteText == "" then return end
@@ -1759,11 +1643,10 @@ function TABS.flight(c)
 	end, a)
 end
 
--- Fuel & Boost: four fuel rows, then boost, then upgrades. Dimmed rows still work.
+-- Fuel: four fuel rows, then upgrades. Dimmed rows still work.
 function TABS.fuel(c)
 	local h = c.isHost
 	local fa = c.fuelOn and 1 or 0.5
-	local ba = c.boostOn and 1 or 0.5
 
 	toggleRow(rowTop(1), T("fuel_system"), T("fuel_sub"), c.fuelOn, h, function()
 		do local nv = not (c.fuelOn) setPending("fuelOn", nv) ServerCall("server.setFuelEnabled", nv) end
@@ -1783,19 +1666,7 @@ function TABS.fuel(c)
 		function() setDelay(c.refillDelay - DELAY_STEP) end,
 		function() setDelay(c.refillDelay + DELAY_STEP) end, fa)
 
-	toggleRow(rowTop(5), T("boost"), T("boost_sub"), c.boostOn, h, function()
-		do local nv = not (c.boostOn) setPending("boostOn", nv) ServerCall("server.setBoostOn", nv) end
-	end)
-
-	stepRow(rowTop(6), T("boost_cd"), T("boost_cd_sub"), string.format("%d s", c.boostCd), h,
-		function() do local nv = clampBoostCd(c.boostCd - 1) setPending("boostCd", nv) ServerCall("server.setBoostCd", nv) end end,
-		function() do local nv = clampBoostCd(c.boostCd + 1) setPending("boostCd", nv) ServerCall("server.setBoostCd", nv) end end, ba)
-
-	stepRow(rowTop(7), T("boost_cost"), T("boost_cost_sub"), string.format("%.1f s", c.boostCost), h,
-		function() do local nv = clampBoostCost(c.boostCost - BOOST_COST_STEP) setPending("boostCost", nv) ServerCall("server.setBoostCost", nv) end end,
-		function() do local nv = clampBoostCost(c.boostCost + BOOST_COST_STEP) setPending("boostCost", nv) ServerCall("server.setBoostCost", nv) end end, ba)
-
-	toggleRow(rowTop(8), T("upgrades"), T("upgrades_sub"), c.upgrades, h, function()
+	toggleRow(rowTop(5), T("upgrades"), T("upgrades_sub"), c.upgrades, h, function()
 		do local nv = not (c.upgrades) setPending("upgrades", nv) ServerCall("server.setUpgrades", nv) end
 	end)
 end
@@ -1817,11 +1688,11 @@ end
 
 function TABS.stats(c)
 	local me = GetLocalPlayer()
-	local peak, dist, time, boosts = getStats(me)
+	local peak, dist, time = getStats(me)
 
 	statCard(-215, 48, 200, 96, STAT_COLORS[1], T("stat_peak"), fmtDist(peak), T("stat_peak_sub"))
 	statCard(0, 48, 200, 96, STAT_COLORS[2], T("stat_dist"), fmtDist(dist), T("stat_dist_sub"))
-	statCard(215, 48, 200, 96, STAT_COLORS[3], T("stat_time"), fmtTime(time), T("stat_boosts", boosts))
+	statCard(215, 48, 200, 96, STAT_COLORS[3], T("stat_time"), fmtTime(time), "")
 
 	local a = c.upgrades and 1 or 0.4
 	card(0, 167, CW, 118)
@@ -2023,13 +1894,11 @@ end
 
 local function resetHostSettings()
 	for _, key in ipairs({ "enabled", "announce", "hover", "smooth" }) do setPending(key, true) end
-	for _, key in ipairs({ "menuHidden", "hostFree", "restrict", "boostOn", "upgrades" }) do setPending(key, false) end
+	for _, key in ipairs({ "menuHidden", "hostFree", "restrict", "upgrades" }) do setPending(key, false) end
 	applyProfileHere("original")
 	setPending("refill", REFILL_DEFAULT)
 	setPending("delay", DELAY_DEFAULT)
 	setPending("ceiling", 0)
-	setPending("boostCd", BOOST_CD_DEFAULT)
-	setPending("boostCost", BOOST_COST_DEFAULT)
 	ServerCall("server.resetAll")
 end
 
@@ -2120,8 +1989,6 @@ local function resetPersonal()
 	setGaugeColor(1)
 	setKbBind("jump")
 	setPadBind("jump")
-	setBoostKb("q")
-	setBoostPad("interact")
 	setFxMode(2)
 	setFlame(1)
 	setAccent(1, true)
@@ -2170,42 +2037,37 @@ end
 -- Everything here only affects this player and is saved on this PC.
 function TABS.controls(c)
 	local pad = nav.active
-	local ba = (shared.boostOn == true) and 1 or 0.6
 
 	local cy = settingRow(rowTop(1), T("flight_key"), pad and T("key_sub_pad") or T("key_sub_kb"), 300)
 	if pad then padPicker(cy, K.pad, setPadBind)
 	else keyPicker(cy, "fly", K.kb, "jump", T("reset"), function() setKbBind("jump") end) end
 
-	cy = settingRow(rowTop(2), T("boost_key"), T("boost_key_sub"), 300, ba)
-	if pad then padPicker(cy, K.boostPad, setBoostPad)
-	else keyPicker(cy, "boost", K.boostKb, "q", T("reset"), function() setBoostKb("q") end) end
-
-	cy = settingRow(rowTop(3), T("menu_key"), T("menu_key_sub"), 300)
+	cy = settingRow(rowTop(2), T("menu_key"), T("menu_key_sub"), 300)
 	if pad then
 		label(T("kb_only"), RIGHT, cy, 18, WHITE, 0.5, "right middle", 200)
 	else
 		keyPicker(cy, "menu", K.quickKey, "", T("clear"), function() setQuickKey("") end)
 	end
 
-	choiceRow(rowTop(4), T("effects"), T("effects_sub"), { "fx_off", "fx_light", "fx_full" },
+	choiceRow(rowTop(3), T("effects"), T("effects_sub"), { "fx_off", "fx_light", "fx_full" },
 		pendingValue("fx", K.fx + 1), true, function(i)
 			setPending("fx", i)
 			setFxMode(i - 1)
 		end)
 
-	choiceRow(rowTop(5), T("flame"), T("flame_sub"), FLAME_KEYS, pendingValue("flame", K.flame), true, function(i)
+	choiceRow(rowTop(4), T("flame"), T("flame_sub"), FLAME_KEYS, pendingValue("flame", K.flame), true, function(i)
 		setPending("flame", i)
 		setFlame(i)
 	end)
 
-	swatchRow(rowTop(6), T("accent"), T("accent_sub"), ACCENT_PALETTE, K.accent,
+	swatchRow(rowTop(5), T("accent"), T("accent_sub"), ACCENT_PALETTE, K.accent,
 		function(i) setAccent(i, true) end, function(col) return col end)
 
-	toggleRow(rowTop(7), T("last_tab"), T("last_tab_sub"), K.remember, true, function()
+	toggleRow(rowTop(6), T("last_tab"), T("last_tab_sub"), K.remember, true, function()
 		setRememberTab(not K.remember)
 	end)
 
-	cy = settingRow(rowTop(8), T("reset_personal"), T("reset_personal_sub"), 330)
+	cy = settingRow(rowTop(7), T("reset_personal"), T("reset_personal_sub"), 330)
 	armedButton("personal", T("reset"), RIGHT - 90, cy, 180, 32, function()
 		resetPersonal()
 		toast(T("toast_personal_reset"))
@@ -2368,9 +2230,6 @@ local function drawWindow()
 		refill = pendingValue("refill", shared.refill or REFILL_DEFAULT),
 		refillDelay = pendingValue("delay", shared.refillDelay or DELAY_DEFAULT),
 		hover = pendingValue("hover", shared.hover ~= false),
-		boostOn = pendingValue("boostOn", shared.boostOn == true),
-		boostCd = pendingValue("boostCd", shared.boostCd or BOOST_CD_DEFAULT),
-		boostCost = pendingValue("boostCost", shared.boostCost or BOOST_COST_DEFAULT),
 		upgrades = pendingValue("upgrades", shared.upgrades == true),
 		ceiling = pendingValue("ceiling", shared.ceiling or 0),
 		hostFree = pendingValue("hostFree", shared.hostFree == true),
@@ -2435,7 +2294,6 @@ function client.draw()
 	if not K.open then
 		if shared.fuelEnabled then drawGauge() end
 		if K.speedHud or K.altHud then drawSpeed() end
-		drawBoost()
 		drawNote()
 		return
 	end
