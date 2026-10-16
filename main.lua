@@ -8,16 +8,16 @@
 -- Saved settings live under savegame.mod.* and keep their names between
 -- versions so nobody loses their setup on update.
 --
--- 28.5: cleanup.
---   * Server setters are generated from small tables instead of copy-pasted.
---   * Settings rows return clicks instead of taking callbacks, so the menu no
---     longer creates dozens of closures every frame.
---   * Per-frame work trimmed (cached tab lists, no string building in T()).
---   * The default accent colour (menu and HUD) is now Mint. Saved accent
---     choices from older versions are kept as they were. Flame colours are
---     unchanged.
+-- File layout:
+--   1. constants and shared helpers
+--   2. server scope (flying, fuel, stats, host setters)
+--   3. client scope (sound, effects, HUD, settings menu)
+--
+-- The changelog lives in the About tab of the in-game settings menu.
+-- Accent colours are saved by position, so new ones only go at the end.
+-- Server setters clamp every value themselves, whatever the client sent.
 
-local VERSION = "28.5"
+local VERSION = "28.6"
 local REVISION = 1
 
 local floor, min, max, sqrt = math.floor, math.min, math.max, math.sqrt
@@ -41,6 +41,7 @@ local CEIL_MIN, CEIL_MAX, CEIL_STEP = 10, 200, 10
 local BIND_RESEND = 3
 local GAUGE_HIDE_DELAY = 3
 local GAUGE_FADE_RATE = 6
+local FX_RANGE = 80  -- other players' exhaust effects are skipped beyond this distance (metres)
 
 local BOOST_TIME, BOOST_MUL = 0.4, 2.6
 local BOOST_CD_MIN, BOOST_CD_MAX, BOOST_CD_DEFAULT = 3, 30, 8
@@ -106,15 +107,26 @@ local function sameList(a, b)
 	return true
 end
 
-local function groundProbe(p)
+local function copyList(list)
+	local out = {}
+	for i = 1, #list do out[i] = list[i] end
+	return out
+end
+
+local function clearList(list)
+	for i = #list, 1, -1 do list[i] = nil end
+end
+
+-- pos is optional, pass it when the caller already has the player's position
+local function groundProbe(p, pos)
 	if not IsPlayerValid(p) then return false end
-	local pos = GetPlayerTransform(p).pos
+	pos = pos or GetPlayerTransform(p).pos
 	local hit, dist = QueryRaycast(Vec(pos[1], pos[2] + 0.25, pos[3]), Vec(0, -1, 0), 0.4)
 	return hit and dist <= 0.4
 end
 
-local function isGrounded(p)
-	local ok, result = pcall(groundProbe, p)
+local function isGrounded(p, pos)
+	local ok, result = pcall(groundProbe, p, pos)
 	return ok and result == true
 end
 
@@ -188,6 +200,35 @@ local function describeProfile(p)
 	return string.format("thrust %d%%, %s, %s", p.thrust, capText, fuelText)
 end
 
+-- Changelog shown in the About tab, newest first. Keep each entry to 10 short lines.
+local CHANGELOG = {
+	{
+		version = "28.6", title = "Polish and bug fixes",
+		notes = {
+			"Menu: new About tab (this one) holds the changelog; sidebar tightened.",
+			"Key binding: capture no longer stays armed after the menu closes.",
+			"Key binding: flight, boost and menu keys can no longer share a key.",
+			"Profiles and Reset all no longer refill tanks or send stray messages.",
+			"Fuel sync now notices players swapping in and out at the same count.",
+			"Fuel gauge no longer fades out while the tank is still refilling.",
+			"Left players are cleaned up on a timer; stats also save on landing.",
+			"Controller: disabled buttons skip focus; tab switching moves focus.",
+			"Performance: shared lists only update on change, fewer allocations,",
+			"distant exhaust skipped past 80 m, one ground check per client tick.",
+		},
+	},
+	{
+		version = "28.5", title = "Cleanup",
+		notes = {
+			"Server setters are generated from small tables instead of copy-pasted.",
+			"Settings rows return clicks instead of callbacks (no per-frame closures).",
+			"Per-frame work trimmed (cached tab lists, no string building in T()).",
+			"Default accent colour (menu and HUD) is now Mint; saved accents are kept.",
+			"Flame colours are unchanged.",
+		},
+	},
+}
+
 
 do  -- server scope
 
@@ -197,9 +238,11 @@ local S = {
 	delay = DELAY_DEFAULT, ceiling = 0, hostFree = false,
 	hover = true, boostOn = false, boostCd = BOOST_CD_DEFAULT, boostCost = BOOST_COST_DEFAULT,
 	upgrades = false, menuHidden = false, announce = true,
-	noteSeq = 0, playerCount = 0, errorShown = false,
-	fuelTimer = 0, statsTimer = 0, saveTimer = 0,
-	lastJetting = {}, lastBoosting = {}, lastFuelValues = {}, lastStats = {},
+	noteSeq = 0, playerCount = 0,
+	errorAt = -100, lastError = "",
+	fuelTimer = 0, statsTimer = 0, saveTimer = 0, cleanTimer = 0,
+	lastJetting = {}, lastBoosting = {}, lastFuelValues = {}, lastFuelIds = {}, lastStats = {},
+	lastShared = {},
 }
 
 -- which shared key mirrors each setting in S
@@ -221,6 +264,10 @@ for _, name in ipairs({
 	R[name] = {}
 end
 
+-- per-tick scratch lists, reused so the server does not allocate every tick
+local flyBuf, boostBuf = {}, {}
+local EMPTY = {}
+
 local function validPlayer(pid) return type(pid) == "number" and IsPlayerValid(pid) end
 
 local function notify(text, force)
@@ -228,6 +275,13 @@ local function notify(text, force)
 	S.noteSeq = S.noteSeq + 1
 	shared.noteText = text
 	shared.noteSeq = S.noteSeq
+end
+
+-- Writes a list to shared only when it really changed, so clients are not re-synced for nothing.
+local function publishList(key, list)
+	if sameList(list, S.lastShared[key] or EMPTY) then return end
+	S.lastShared[key] = list
+	shared[key] = list
 end
 
 local function publishAllowed()
@@ -240,7 +294,7 @@ local function publishAllowed()
 		end
 	end
 	table.sort(list)
-	shared.allowed = list
+	publishList("allowed", list)
 end
 
 local function publishFuel(force)
@@ -251,10 +305,11 @@ local function publishFuel(force)
 		ids[i] = p
 		values[i] = round((R.fuel[p] or S.tank) * 10) / 10
 	end
-	if force or not sameList(values, S.lastFuelValues) or #ids ~= #(shared.fuelIds or {}) then
+	if force or not sameList(values, S.lastFuelValues) or not sameList(ids, S.lastFuelIds) then
 		shared.fuelIds = ids
 		shared.fuelVals = values
 		S.lastFuelValues = values
+		S.lastFuelIds = ids
 	end
 end
 
@@ -268,7 +323,7 @@ local function publishMuls()
 			list[#list + 1] = f
 		end
 	end
-	shared.pm = list
+	publishList("pm", list)
 end
 
 local function publishFlames()
@@ -280,7 +335,7 @@ local function publishFlames()
 			list[#list + 1] = flame
 		end
 	end
-	shared.pf = list
+	publishList("pf", list)
 end
 
 local function statKey(p)
@@ -370,14 +425,16 @@ local function defNum(fname, field, saveKey, clampFn, scale, after)
 end
 
 -- on/off setting. inv = the saved flag means "off" (e.g. savegame.mod.disabled).
+-- after(on, silent, old) runs once the value is stored; old is the previous value.
 local function defBool(fname, field, saveKey, inv, after)
 	local shareKey = SHARE[field]
 	server[fname] = function(on, silent)
 		on = on and true or false
+		local old = S[field]
 		S[field] = on
 		shared[shareKey] = on
 		if saveKey then SetInt(saveKey, (on ~= inv) and 1 or 0) end
-		if after then after(on, silent) end
+		if after then after(on, silent, old) end
 	end
 end
 
@@ -416,15 +473,21 @@ defBool("setAnnounce", "announce", "savegame.mod.quiet", true, function(on, sile
 		notify(on and "Host turned settings messages on" or "Host turned settings messages off", true)
 	end
 end)
-defBool("setFuelEnabled", "fuelOn", "savegame.mod.fuel_enabled", false, function(on)
+-- Only a real on/off change resets everyone's fuel (applying a profile with fuel already on must not).
+defBool("setFuelEnabled", "fuelOn", "savegame.mod.fuel_enabled", false, function(on, _, old)
+	if on == old then return end
 	R.fuel = {}
 	S.lastFuelValues = {}
+	S.lastFuelIds = {}
 	shared.fuelIds = {}
 	shared.fuelVals = {}
 	if on then publishFuel(true) end
 end)
 
 function server.init()
+	S.lastShared = {}
+	S.lastFuelValues, S.lastFuelIds = {}, {}
+
 	S.menuHidden = GetInt("savegame.mod.menu_hidden") == 1
 	S.announce = GetInt("savegame.mod.quiet") ~= 1
 	S.on = GetInt("savegame.mod.disabled") ~= 1
@@ -608,7 +671,8 @@ function server.setPlayerBind(pid, bind, boostBind, flame)
 	boostBind = normalizeBind(boostBind)
 	if boostBind then R.boostBinds[pid] = boostBind end
 	flame = floor(num(flame, FLAME_DEFAULT))
-	if FLAME_PALETTE[flame] then
+	-- this call repeats every few seconds, so only publish when the flame really changed
+	if FLAME_PALETTE[flame] and R.flames[pid] ~= flame then
 		R.flames[pid] = flame
 		publishFlames()
 	end
@@ -622,14 +686,22 @@ local function checkPlayers()
 	end
 end
 
-function server.tick()
+function server.tick(dt)
 	pcall(checkPlayers)
+	-- also clean up on a timer: one player leaving as another joins keeps the count the same
+	S.cleanTimer = S.cleanTimer + (dt or 0.02)
+	if S.cleanTimer >= 2 then
+		S.cleanTimer = 0
+		pcall(forgetLeftPlayers)
+	end
 end
 
 local function reportError(err)
-	if S.errorShown then return end
-	S.errorShown = true
-	DebugPrint("Jetpack (Multiplayer) error: " .. tostring(err))
+	err = tostring(err)
+	local now = GetTime()
+	if now - S.errorAt < (err == S.lastError and 30 or 5) then return end
+	S.errorAt, S.lastError = now, err
+	DebugPrint("Jetpack (Multiplayer) error: " .. err)
 end
 
 -- One player, one physics step.
@@ -655,7 +727,7 @@ local function stepOne(p, dt, flying, boosting)
 	local flyingNow = wantsToFly and hasFuel
 
 	local pos = GetPlayerTransform(p).pos
-	local grounded = inVehicle or isGrounded(p)
+	local grounded = inVehicle or isGrounded(p, pos)
 
 	if grounded or health <= 0 or R.baseY[p] == nil then R.baseY[p] = pos[2] end
 	local ceilRoom = S.ceiling > 0 and (S.ceiling - (pos[2] - R.baseY[p])) or nil
@@ -723,7 +795,10 @@ local function stepOne(p, dt, flying, boosting)
 
 	-- Flight stats: peak height above take-off and horizontal distance while airborne.
 	if flyingNow then R.airborne[p] = true end
-	if grounded or health <= 0 then R.airborne[p] = false end
+	if grounded or health <= 0 then
+		if R.airborne[p] then saveStat(s) end  -- just landed: write the stats out
+		R.airborne[p] = false
+	end
 	local moved = 0
 	local lx = R.lastX[p]
 	if lx then
@@ -740,20 +815,23 @@ local function stepOne(p, dt, flying, boosting)
 end
 
 local function stepPlayers(dt)
-	local flying, boosting = {}, {}
+	clearList(flyBuf)
+	clearList(boostBuf)
 	for _, p in ipairs(GetAllPlayers()) do
 		-- one broken player can never stop the others
-		local ok, err = pcall(stepOne, p, dt, flying, boosting)
+		local ok, err = pcall(stepOne, p, dt, flyBuf, boostBuf)
 		if not ok then reportError(err) end
 	end
 
-	if not sameList(flying, S.lastJetting) then
-		shared.jetting = flying
-		S.lastJetting = flying
+	if not sameList(flyBuf, S.lastJetting) then
+		local copy = copyList(flyBuf)
+		shared.jetting = copy
+		S.lastJetting = copy
 	end
-	if not sameList(boosting, S.lastBoosting) then
-		shared.boosting = boosting
-		S.lastBoosting = boosting
+	if not sameList(boostBuf, S.lastBoosting) then
+		local copy = copyList(boostBuf)
+		shared.boosting = copy
+		S.lastBoosting = copy
 	end
 
 	if S.fuelOn then
@@ -797,7 +875,7 @@ local STRINGS = {
 
 	sec_game = "Game", sec_host = "Host tools", sec_you = "You",
 	tab_flight = "Flight", tab_fuel = "Fuel & Boost", tab_players = "Players", tab_admin = "Admin",
-	tab_controls = "Controls", tab_hud = "HUD", tab_stats = "Stats",
+	tab_controls = "Controls", tab_hud = "HUD", tab_stats = "Stats", tab_about = "About",
 
 	jetpack = "Jetpack", jetpack_sub = "Turn the jetpack on or off for everyone",
 	thrust = "Thrust", thrust_sub = "%d%% - %d%%, where 100%% is the original",
@@ -838,7 +916,7 @@ local STRINGS = {
 	key_sub_kb = "Click the button, then press a key",
 	key_sub_pad = "Pick the action that makes you fly",
 	press_key = "Press a key...", clear = "Clear", kb_only = "Keyboard only",
-	key_in_use = "That key is already used for flying or boost",
+	key_in_use = "That key is already used for flying, boost or the menu",
 	boost_key = "Boost key", boost_key_sub = "Press it while flying for a short burst",
 	menu_key = "Menu key", menu_key_sub = "Open and close this menu without pausing", menu_key_none = "Not set",
 	effects = "Exhaust effects", effects_sub = "Flames and smoke behind jetpacks",
@@ -866,6 +944,9 @@ local STRINGS = {
 	up_tier = "Tier %d   +%d%%", up_locked = "Locked", up_max = "MAX",
 	pilots = "Pilots", pilots_more = "Pilots (+%d more)",
 	col_peak = "PEAK", col_dist = "DISTANCE", col_time = "TIME",
+
+	about_name = "Jetpack (Multiplayer)", about_based = "Based on the built-in Jetpack by Tuxedo Labs.",
+	about_revision = "Revision %d", changelog = "Changelog",
 
 	hud_fuel = "FUEL  %.1fs", hud_empty = "FUEL EMPTY",
 	boost_ready = "BOOST READY", boost_wait = "BOOST  %ds", alt_value = "ALT %d m",
@@ -897,7 +978,7 @@ local K = {
 	autoHide = true, gaugeAlpha = 1, groundTime = 0, gaugeSize = 2, gaugePos = 1, gaugeColor = 1,
 	speedHud = false, speedShown = 0, speedUnit = 1, altHud = false, altShown = 0, altGroundY = nil,
 	fx = 2, flame = FLAME_DEFAULT, toastText = "", toastUntil = 0, noteText = "", noteUntil = 0, lastNoteSeq = nil,
-	boostCd = 0, wasBoosting = false, page = 1, armedId = nil, armedUntil = 0,
+	boostCd = 0, wasBoosting = false, page = 1, armedId = nil, armedUntil = 0, aboutIdx = 1,
 	accent = ACCENT_DEFAULT, snd = 0,
 }
 
@@ -1089,6 +1170,14 @@ local function startCapture(target)
 	K.captureStart = GetTime()
 end
 
+-- true when key is already used by one of the other two key settings
+local function keyTaken(target, key)
+	if target ~= "fly" and key == K.kb then return true end
+	if target ~= "boost" and key == K.boostKb then return true end
+	if target ~= "menu" and key == K.quickKey then return true end
+	return false
+end
+
 local function pollCapture(pad)
 	if not K.capturing or GetTime() - K.captureStart < 0.2 then return end
 	local key = InputLastPressedKey()
@@ -1096,14 +1185,12 @@ local function pollCapture(pad)
 	K.capturing = false
 	if key == "esc" or not VALID_INPUTS[key] then return end
 	local target = K.captureTarget
-	if target == "boost" then
+	if keyTaken(target, key) then
+		K.toastText, K.toastUntil = T("key_in_use"), GetTime() + 3
+	elseif target == "boost" then
 		setBoostKb(key, pad)
 	elseif target == "menu" then
-		if key == K.kb or key == K.boostKb then
-			K.toastText, K.toastUntil = T("key_in_use"), GetTime() + 3
-		else
-			setQuickKey(key)
-		end
+		setQuickKey(key)
 	else
 		setKbBind(key, pad)
 	end
@@ -1209,7 +1296,7 @@ function client.init()
 
 	v = GetInt("savegame.mod.fxmode")
 	if v >= 1 and v <= 3 then K.fx = v - 1 end
-	v = GetInt("savegame.mod.flame")  -- 0 = never chosen, so the default (mint) applies
+	v = GetInt("savegame.mod.flame")  -- 0 = never chosen, so the default (orange) applies
 	if FLAME_PALETTE[v] then K.flame = v end
 
 	v = GetInt("savegame.mod.gauge_size")
@@ -1241,6 +1328,8 @@ function client.tick(dt)
 	elseif K.open then
 		K.open = false
 	end
+	-- a key capture must never survive the menu closing, or the next key press would rebind silently
+	if not K.open then K.capturing = false end
 	pollCapture(pad)
 
 	local seq = shared.noteSeq
@@ -1268,13 +1357,20 @@ function client.tick(dt)
 		if ok and vel then K.speedShown = K.speedShown + (VecLength(vel) - K.speedShown) * min(1, dt * 10) end
 	end
 
-	if K.altHud then
+	-- one position read and one ground check per tick, shared by the fuel and altitude code
+	local grounded, myPos = false, nil
+	if fuelOn or K.altHud then
 		local ok, t = pcall(GetPlayerTransform, me)
 		if ok and t then
-			local y = t.pos[2]
-			if K.altGroundY == nil or health <= 0 or inVehicle or isGrounded(me) then K.altGroundY = y end
-			K.altShown = K.altShown + (max(0, y - K.altGroundY) - K.altShown) * min(1, dt * 10)
+			myPos = t.pos
+			grounded = inVehicle or isGrounded(me, myPos)
 		end
+	end
+
+	if K.altHud and myPos then
+		local y = myPos[2]
+		if K.altGroundY == nil or health <= 0 or grounded then K.altGroundY = y end
+		K.altShown = K.altShown + (max(0, y - K.altGroundY) - K.altShown) * min(1, dt * 10)
 	end
 
 	local boostingList = shared.boosting
@@ -1287,7 +1383,6 @@ function client.tick(dt)
 	local flying = wantsToFly and (not fuelOn or K.localFuel > 0.02)
 
 	if fuelOn then
-		local grounded = inVehicle or isGrounded(me)
 		local endurance, refillMul = fuelMultipliers(me)
 
 		if flying then
@@ -1302,15 +1397,18 @@ function client.tick(dt)
 		end
 
 		if grounded and not flying then K.groundTime = K.groundTime + dt else K.groundTime = 0 end
-		local target = (K.autoHide and K.groundTime > GAUGE_HIDE_DELAY) and 0 or 1
+		-- only fade the gauge once the tank is full again
+		local full = K.localFuel >= tank - 0.05
+		local target = (K.autoHide and full and K.groundTime > GAUGE_HIDE_DELAY) and 0 or 1
 		K.gaugeAlpha = K.gaugeAlpha + (target - K.gaugeAlpha) * min(1, dt * GAUGE_FADE_RATE)
 	else
 		K.groundTime = 0
 		K.gaugeAlpha = 1
 	end
 
+	local camPos = GetCameraTransform().pos
 	if flying then
-		PlayLoop(K.snd, GetCameraTransform().pos, SOUND_VOLUME)
+		PlayLoop(K.snd, camPos, SOUND_VOLUME)
 		if K.fx > 0 then pcall(spawnExhaust, me, K.fx, meBoosting) end
 	end
 
@@ -1319,8 +1417,12 @@ function client.tick(dt)
 		for i = 1, #others do
 			local p = others[i]
 			if p ~= me and IsPlayerValid(p) then
-				PlayLoop(K.snd, GetPlayerTransform(p).pos, SOUND_VOLUME)
-				if K.fx > 0 then pcall(spawnExhaust, p, K.fx, listHas(boostingList, p)) end
+				local pos = GetPlayerTransform(p).pos
+				PlayLoop(K.snd, pos, SOUND_VOLUME)
+				-- skip particles and lights for jetpacks too far away to notice
+				if K.fx > 0 and VecLength(VecSub(pos, camPos)) < FX_RANGE then
+					pcall(spawnExhaust, p, K.fx, listHas(boostingList, p))
+				end
 			end
 		end
 	end
@@ -1340,8 +1442,10 @@ local CONTENT_X, CW = 100, 630
 local PAD = 20
 local LEFT, RIGHT = -CW / 2 + PAD, CW / 2 - PAD
 local ROW_H, ROW_STEP = 44, 48
+local TAB_H, TAB_STEP, HEAD_STEP = 34, 38, 22
 
-local nav = { items = {}, focus = 1, active = false, accept = false, offset = 0, offsetY = 0 }
+-- nav.items is a pool that is reused every frame; nav.n is how many entries are live this frame
+local nav = { items = {}, n = 0, focus = 1, active = false, accept = false, offset = 0, offsetY = 0 }
 local pressHandled = false
 
 local function label(text, x, y, size, color, alpha, align, maxWidth)
@@ -1385,8 +1489,14 @@ end
 
 -- Registers a clickable area for controller focus and returns true when it is activated.
 local function hit(x, y, w, h)
-	local id = #nav.items + 1
-	nav.items[id] = { x = nav.offset + x, y = nav.offsetY + y }
+	local id = nav.n + 1
+	nav.n = id
+	local item = nav.items[id]
+	if not item then
+		item = {}
+		nav.items[id] = item
+	end
+	item.x, item.y = nav.offset + x, nav.offsetY + y
 
 	if nav.active then
 		if id ~= nav.focus then return false end
@@ -1438,7 +1548,9 @@ local function button(text, x, y, w, h, bg, fg, size, disabled)
 		UiRoundedRect(w, h, 8)
 	UiPop()
 	label(text, x, y, size or 22, fg, a, "center middle", w - 14)
-	return hit(x, y, w, h) and not disabled
+	-- disabled buttons are not registered, so a controller can never focus them
+	if disabled then return false end
+	return hit(x, y, w, h)
 end
 
 local function switch(x, y, on)
@@ -1458,10 +1570,11 @@ end
 
 local function moveFocus(dx, dy)
 	local current = nav.items[nav.focus]
-	if not current then nav.focus = 1 return end
+	if not current or nav.focus > nav.n then nav.focus = 1 return end
 	local best, bestScore
-	for i, item in ipairs(nav.items) do
+	for i = 1, nav.n do
 		if i ~= nav.focus then
+			local item = nav.items[i]
 			local ox, oy = item.x - current.x, item.y - current.y
 			local along = dx * ox + dy * oy
 			if along > 4 then
@@ -1475,7 +1588,7 @@ end
 
 local function handleControllerInput(tabs)
 	if not nav.active then return end
-	nav.focus = clamp(nav.focus, 1, max(1, #nav.items))
+	nav.focus = clamp(nav.focus, 1, max(1, nav.n))
 	if InputPressed("menu_up") then moveFocus(0, -1) end
 	if InputPressed("menu_down") then moveFocus(0, 1) end
 	if InputPressed("menu_left") then moveFocus(-1, 0) end
@@ -1487,7 +1600,11 @@ local function handleControllerInput(tabs)
 	if step ~= 0 then
 		for i = 1, #tabs do
 			if tabs[i].id == K.tab then
-				K.tab = tabs[(i - 1 + step) % #tabs + 1].id
+				local nextIndex = (i - 1 + step) % #tabs + 1
+				K.tab = tabs[nextIndex].id
+				K.capturing = false
+				-- the sidebar buttons are the first nav entries, in tab order
+				nav.focus = nextIndex
 				break
 			end
 		end
@@ -1982,14 +2099,19 @@ local function profileDef(name)
 	return PROFILES[name]
 end
 
-local function applyProfileHere(name)
-	local p = profileDef(name)
-	if not p then return end
+-- show a profile's values straight away while the server catches up
+local function setProfilePending(p)
 	setPending("thrust", p.thrust)
 	setPending("cap", p.cap)
 	setPending("smooth", p.smooth)
 	setPending("fuelOn", p.fuel)
 	setPending("tank", p.tank)
+end
+
+local function applyProfileHere(name)
+	local p = profileDef(name)
+	if not p then return end
+	setProfilePending(p)
 	ServerCall("server.applyProfile", name)
 end
 
@@ -2007,7 +2129,8 @@ end
 local function resetHostSettings()
 	for _, key in ipairs({ "enabled", "announce", "hover", "smooth" }) do setPending(key, true) end
 	for _, key in ipairs({ "menuHidden", "hostFree", "restrict", "boostOn", "upgrades" }) do setPending(key, false) end
-	applyProfileHere("original")
+	-- resetAll on the server applies the Original profile itself, so only the display is updated here
+	setProfilePending(PROFILES.original)
 	setPending("refill", REFILL_DEFAULT)
 	setPending("delay", DELAY_DEFAULT)
 	setPending("ceiling", 0)
@@ -2116,13 +2239,14 @@ local function resetPersonal()
 	setGaugeSize(2)
 	setGaugePos(1)
 	setGaugeColor(1)
-	local pad = usingPad()
-	setKbBind("jump", pad)
-	setPadBind("jump", pad)
-	setBoostKb("q", pad)
-	setBoostPad("interact", pad)
+	-- set the saved values directly and tell the server once, instead of once per key
+	setStr("kb", "savegame.mod.flykey", "jump")
+	setStr("pad", "savegame.mod.padkey", "jump")
+	setStr("boostKb", "savegame.mod.boostkey", "q")
+	setStr("boostPad", "savegame.mod.boostpadkey", "interact")
 	setFxMode(2)
-	setFlame(FLAME_DEFAULT)
+	setInt("flame", "savegame.mod.flame", FLAME_DEFAULT)
+	sendBind(usingPad())
 	setAccent(ACCENT_DEFAULT, true)
 	setQuickKey("")
 	setRememberTab(true)
@@ -2217,11 +2341,52 @@ function TABS.hud()
 	if pick then setGaugeColor(pick) end
 end
 
+-- About: name, version and the changelog (newest entry first, arrows step through older ones).
+function TABS.about()
+	local n = #CHANGELOG
+	K.aboutIdx = clamp(K.aboutIdx, 1, n)
+	local entry = CHANGELOG[K.aboutIdx]
+
+	card(0, 40, CW, 80)
+	label(T("about_name"), LEFT, 24, 24, WHITE, 1, "left middle", 340)
+	label(T("about_based"), LEFT, 56, 14, WHITE, 0.55, "left middle", 340)
+	label("v" .. VERSION, RIGHT, 24, 24, ACCENT, 1, "right middle", 200)
+	label(T("about_revision", REVISION), RIGHT, 56, 15, WHITE, 0.55, "right middle", 200)
+
+	card(0, 235, CW, 290)
+	label(T("changelog"), LEFT, 112, 20, WHITE, 1, "left middle", 200)
+	if n > 1 then
+		if button("<", 130, 112, 36, 26, BTN, WHITE, 18) then K.aboutIdx = (K.aboutIdx - 2) % n + 1 end
+		label(entry.version .. "  (" .. K.aboutIdx .. "/" .. n .. ")", 205, 112, 15, WHITE, 0.8, "center middle", 88)
+		if button(">", 277, 112, 36, 26, BTN, WHITE, 18) then K.aboutIdx = K.aboutIdx % n + 1 end
+	end
+
+	UiPush()
+		UiTranslate(0, 132)
+		UiAlign("center middle")
+		UiColor(1, 1, 1, 0.10)
+		UiRect(CW - 40, 2)
+	UiPop()
+
+	label(entry.version .. "  -  " .. entry.title, LEFT, 152, 17, ACCENT, 1, "left middle", CW - 40)
+	for i, line in ipairs(entry.notes) do
+		local y = 178 + (i - 1) * 21
+		UiPush()
+			UiTranslate(LEFT + 4, y)
+			UiAlign("center middle")
+			UiColor(ACCENT[1], ACCENT[2], ACCENT[3], 0.8)
+			UiRoundedRect(5, 5, 2.5)
+		UiPop()
+		label(line, LEFT + 16, y, 14, WHITE, 0.8, "left middle", CW - 56)
+	end
+end
+
 
 -- settings window ---------------------------------------------------------------------------
 
 local tabCache = {}
 
+-- About is always the last tab and is drawn pinned to the bottom of the sidebar.
 local function buildTabs(isHost, multiplayer)
 	local cacheKey = (isHost and 1 or 0) + (multiplayer and 2 or 0)
 	local tabs = tabCache[cacheKey]
@@ -2240,6 +2405,7 @@ local function buildTabs(isHost, multiplayer)
 	tabs[#tabs + 1] = { id = "controls", name = T("tab_controls"), section = "sec_you" }
 	tabs[#tabs + 1] = { id = "hud", name = T("tab_hud"), section = "sec_you" }
 	tabs[#tabs + 1] = { id = "stats", name = T("tab_stats"), section = "sec_you" }
+	tabs[#tabs + 1] = { id = "about", name = T("tab_about"), bottom = true }
 	tabCache[cacheKey] = tabs
 	return tabs
 end
@@ -2277,18 +2443,30 @@ local function drawSidebar(tabs)
 	local y, section = BODY_TOP + 6, nil
 	for i = 1, #tabs do
 		local entry = tabs[i]
-		if entry.section ~= section then
-			section = entry.section
-			label(string.upper(T(section)), SIDEBAR_X - (SIDEBAR_W - 24) / 2 + 4, y + 13, 13, WHITE, 0.4, "left middle")
-			y = y + 24
+		local cy
+		if entry.bottom then
+			cy = BODY_TOP + BODY_H - 6 - TAB_H / 2
+			UiPush()
+				UiTranslate(SIDEBAR_X, cy - TAB_H / 2 - 4)
+				UiAlign("center middle")
+				UiColor(1, 1, 1, 0.10)
+				UiRect(SIDEBAR_W - 24, 1)
+			UiPop()
+		else
+			if entry.section ~= section then
+				section = entry.section
+				label(string.upper(T(section)), SIDEBAR_X - (SIDEBAR_W - 24) / 2 + 4, y + HEAD_STEP / 2, 13, WHITE, 0.4, "left middle")
+				y = y + HEAD_STEP
+			end
+			cy = y + TAB_H / 2
+			y = y + TAB_STEP
 		end
 		local active = (K.tab == entry.id)
-		if button(entry.name, SIDEBAR_X, y + 19, SIDEBAR_W - 24, 36,
+		if button(entry.name, SIDEBAR_X, cy, SIDEBAR_W - 24, TAB_H,
 			active and ACCENT or BTN, active and DARK or WHITE, 19) then
 			K.tab = entry.id
 			K.capturing = false
 		end
-		y = y + 42
 	end
 end
 
@@ -2320,7 +2498,7 @@ local function drawWindow()
 
 	nav.active = usingPad()
 	nav.accept = nav.active and InputPressed("menu_accept") and GetTime() - K.openedAt > 0.2
-	nav.items = {}
+	nav.n = 0
 
 	local jetting = shared.jetting
 	local c = {
@@ -2394,6 +2572,9 @@ local function drawWindow()
 
 	drawNote()
 	handleControllerInput(tabs)
+
+	-- a press that never became a release must not swallow the next real click
+	if not InputDown("lmb") then pressHandled = false end
 end
 
 function client.draw()
