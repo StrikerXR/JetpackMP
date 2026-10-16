@@ -412,6 +412,14 @@ end
 -- Everything below is called from the host's settings screen. The server
 -- clamps every value itself, whatever the client sent.
 
+setmetatable(server, {
+	__index = function(t, k)
+		if type(k) == "string" and k:sub(1, 7) == "server." then
+			return rawget(t, k:sub(8))
+		end
+	end
+})
+
 -- number setting: clamp, keep in S, mirror to shared, save (scaled to an int if needed)
 local function defNum(fname, field, saveKey, clampFn, scale, after)
 	local shareKey = SHARE[field]
@@ -1074,7 +1082,7 @@ end
 
 local function send(key, fn, value)
 	setPending(key, value)
-	ServerCall(fn, value)
+	ServerCall(fn:gsub("^server%.", ""), value)
 end
 
 local function usingPad()
@@ -1084,7 +1092,7 @@ end
 
 local function sendBind(pad)
 	K.bindTimer = 0
-	ServerCall("server.setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb, K.flame)
+	ServerCall("setPlayerBind", GetLocalPlayer(), pad and K.pad or K.kb, pad and K.boostPad or K.boostKb, K.flame)
 end
 
 local function bindLabel(name)
@@ -1312,7 +1320,7 @@ end
 function client.tick(dt)
 	local me = GetLocalPlayer()
 	local pad = usingPad()
-	K.sp = GetPlayerCount() <= 1
+	K.sp = not ((IsMultiplayer and IsMultiplayer()) or GetPlayerCount() > 1)
 
 	K.bindTimer = K.bindTimer + dt
 	if K.bindTimer >= BIND_RESEND or pad ~= K.wasPad then
@@ -1692,7 +1700,8 @@ local function drawBoost()
 
 	local ax, ay, s, top = gaugeAnchor()
 	local dir = top and -1 or 1
-	local y = ay + dir * 24 * s
+	local offset = top and 24 or 56
+	local y = ay - dir * offset * s
 	local total = max(1, shared.boostCd or BOOST_CD_DEFAULT)
 	local ready = K.boostCd <= 0
 	local frac = ready and 1 or (1 - K.boostCd / total)
@@ -1999,7 +2008,7 @@ end
 local function stepMul(p, kind, current, delta, hi)
 	local value = clampMul(current + delta, hi)
 	setPending((kind == "thrust" and "mt" or "mf") .. p, value)
-	ServerCall("server.setPlayerMul", p, kind, value)
+	ServerCall("setPlayerMul", p, kind, value)
 end
 
 function TABS.players(c)
@@ -2009,10 +2018,10 @@ function TABS.players(c)
 	end
 
 	if button(T("allow_all"), -155, 72, 300, 26, GREEN, WHITE, 16, not c.restrict) then
-		ServerCall("server.setAllowedAll", true)
+		ServerCall("setAllowedAll", true)
 	end
 	if button(T("block_all"), 155, 72, 300, 26, RED, WHITE, 16, not c.restrict) then
-		ServerCall("server.setAllowedAll", false)
+		ServerCall("setAllowedAll", false)
 	end
 
 	local players = GetAllPlayers()
@@ -2042,7 +2051,7 @@ function TABS.players(c)
 				can and GREEN or RED, WHITE, 16) then
 				setPending("fly" .. p, not can)
 				if can then setPending("restrict", true) end
-				ServerCall("server.setPlayerFlight", p, not can)
+				ServerCall("setPlayerFlight", p, not can)
 			end
 		end
 
@@ -2063,13 +2072,13 @@ function TABS.players(c)
 		if button(T("reset"), 108, y2, 76, 26, BTN, WHITE, 15, oT == 100 and oF == 100) then
 			setPending("mt" .. p, 100)
 			setPending("mf" .. p, 100)
-			ServerCall("server.resetPlayer", p)
+			ServerCall("resetPlayer", p)
 		end
 
 		if c.fuelOn and not (c.hostFree and isHostPlayer) then
 			local amount = serverFuelFor(p) or c.tank
 			if button(T("refill") .. string.format("  %.1f s", amount), RIGHT - 65, y2, 130, 26, BTN, WHITE, 15) then
-				ServerCall("server.refillPlayer", p)
+				ServerCall("refillPlayer", p)
 			end
 		end
 	end
@@ -2112,7 +2121,7 @@ local function applyProfileHere(name)
 	local p = profileDef(name)
 	if not p then return end
 	setProfilePending(p)
-	ServerCall("server.applyProfile", name)
+	ServerCall("applyProfile", name)
 end
 
 local function activeProfile(c)
@@ -2136,7 +2145,7 @@ local function resetHostSettings()
 	setPending("ceiling", 0)
 	setPending("boostCd", BOOST_CD_DEFAULT)
 	setPending("boostCost", BOOST_COST_DEFAULT)
-	ServerCall("server.resetAll")
+	ServerCall("resetAll")
 end
 
 -- bottom action bar of the Admin tab
@@ -2161,13 +2170,13 @@ end
 
 local function runAction(id)
 	if id == "refill" then
-		ServerCall("server.refillAll")
+		ServerCall("refillAll")
 		toast(T("toast_refilled"))
 	elseif id == "overrides" then
-		ServerCall("server.resetOverrides")
+		ServerCall("resetOverrides")
 		toast(T("toast_cleared"))
 	elseif id == "stats" then
-		ServerCall("server.resetStats")
+		ServerCall("resetStats")
 		toast(T("toast_stats_reset"))
 	elseif id == "all" then
 		resetHostSettings()
@@ -2193,7 +2202,7 @@ function TABS.admin(c)
 	label(T("save_to"), LEFT, 111, 15, WHITE, 0.55, "left middle", 170)
 	for slot = 1, 2 do
 		if button(T("custom_" .. slot), -70 + (slot - 1) * 130, 111, 120, 26, GREEN, WHITE, 16) then
-			ServerCall("server.saveCustom", slot)
+			ServerCall("saveCustom", slot)
 			toast(T("toast_saved", T("custom_" .. slot)))
 		end
 	end
@@ -2494,7 +2503,7 @@ local function drawWindow()
 	local me = GetLocalPlayer()
 	local isHost = IsPlayerHost(me)
 	local playerCount = GetPlayerCount()
-	local multiplayer = playerCount > 1
+	local multiplayer = (IsMultiplayer and IsMultiplayer()) or playerCount > 1
 
 	nav.active = usingPad()
 	nav.accept = nav.active and InputPressed("menu_accept") and GetTime() - K.openedAt > 0.2
