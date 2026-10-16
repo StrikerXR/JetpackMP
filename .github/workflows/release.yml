@@ -23,11 +23,11 @@ concurrency:
 env:
   VERSION_FILE: main.lua
   # Only look for the VERSION line in the first N lines ("top of the file").
-  VERSION_SCAN_LINES: 60
+  VERSION_SCAN_LINES: 22
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
 
     steps:
