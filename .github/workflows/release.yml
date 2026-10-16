@@ -5,6 +5,13 @@ name: Release on main.lua change
 # and publishes .zip (primary) plus .tar.gz and .7z (secondary).
 # Any archive that fails to build or fails verification is skipped;
 # the release still ships with whatever archives succeeded.
+#
+# Extras:
+#   - Changelog lists every commit since the previous tag
+#   - Version format validation + version bump guard
+#   - Pre-release auto-detection (-alpha / -beta / -rc / -dev)
+#   - Manual runs can create a draft and/or force pre-release
+#   - Per-file .sha256 files + checksum re-verification right before upload
 
 on:
   push:
@@ -12,6 +19,15 @@ on:
     paths:
       - main.lua
   workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create as a draft (not public). Never touches an existing release."
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as pre-release (also skips the 'latest' badge)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -24,6 +40,15 @@ env:
   VERSION_FILE: main.lua
   # Only look for the VERSION line in the first N lines ("top of the file").
   VERSION_SCAN_LINES: 60
+  # Accepted formats: 28.5   28.5.1   28.5-beta   28.5.1-rc1   28.5-dev.2
+  VERSION_REGEX: '^[0-9]+\.[0-9]+(\.[0-9]+)?(-(alpha|beta|rc|dev)(\.?[0-9]+)?)?$'
+  # Versions containing one of these suffixes are published as pre-releases.
+  PRERELEASE_REGEX: '-(alpha|beta|rc|dev)'
+  # If true, a push that reuses an existing VERSION fails instead of warning.
+  # (Manual runs always just warn, since re-running is usually intentional.)
+  FAIL_ON_UNCHANGED_VERSION: "false"
+  # Max commits listed in the changelog.
+  CHANGELOG_MAX_COMMITS: 100
 
 jobs:
   release:
@@ -37,11 +62,13 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------------
-      # 1. Read the version from main.lua
+      # 1. Read + validate the version from main.lua
       # ------------------------------------------------------------------
       - name: Extract VERSION from main.lua
         id: version
         shell: bash
+        env:
+          INPUT_PRERELEASE: ${{ inputs.prerelease || false }}
         run: |
           set -euo pipefail
 
@@ -68,15 +95,114 @@ jobs:
 
           VERSION="$(printf '%s' "$LINE" | sed -E "s/.*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
 
-          if [[ ! "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]]; then
-            echo "::error::Extracted version '$VERSION' contains unsupported characters"
+          # Format validation (catches typos like "28.5." or "28,5")
+          if [[ ! "$VERSION" =~ $VERSION_REGEX ]]; then
+            echo "::error::Version '$VERSION' does not match the expected format. Examples: 28.5, 28.5.1, 28.5-beta, 28.6-rc1, 29.0-dev.2"
             exit 1
+          fi
+
+          # Pre-release detection: suffix in version OR manual input
+          PRERELEASE=false
+          if [[ "$VERSION" =~ $PRERELEASE_REGEX ]]; then
+            PRERELEASE=true
+            echo "Pre-release suffix detected in version"
+          fi
+          if [[ "$INPUT_PRERELEASE" == "true" ]]; then
+            PRERELEASE=true
+            echo "Pre-release forced by workflow_dispatch input"
           fi
 
           echo "Found: $LINE"
           echo "Version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "Pre-release: $PRERELEASE"
+          echo "version=$VERSION"        >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE"  >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 1b. Version bump guard: main.lua changed, but did VERSION?
+      # ------------------------------------------------------------------
+      - name: Version bump guard
+        id: guard
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          COMMIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ inputs.draft || false }}
+        run: |
+          set -euo pipefail
+
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG is new, version was bumped"
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          TAG_SHA="$(git rev-list -n1 "refs/tags/$TAG")"
+
+          # Same commit = just a re-run, nothing suspicious
+          if [[ "$TAG_SHA" == "$COMMIT_SHA" ]]; then
+            echo "::notice::Tag $TAG already points at this commit (re-run)."
+            exit 0
+          fi
+
+          if [[ "$IS_DRAFT" == "true" ]]; then
+            ACTION="Draft mode is on, so the existing release will be left untouched."
+          else
+            ACTION="The existing release will be replaced."
+          fi
+          MSG="main.lua changed but VERSION is still '$VERSION' (tag $TAG already exists at ${TAG_SHA:0:7}). $ACTION"
+
+          if [[ "$EVENT_NAME" == "push" && "$FAIL_ON_UNCHANGED_VERSION" == "true" ]]; then
+            echo "::error::$MSG Bump VERSION in main.lua, or set FAIL_ON_UNCHANGED_VERSION to false."
+            exit 1
+          fi
+
+          echo "::warning::$MSG"
+
+      # ------------------------------------------------------------------
+      # 1c. Changelog: every commit since the previous tag
+      # ------------------------------------------------------------------
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Newest earlier tag reachable from this commit, excluding the tag
+          # we're about to (re)create.
+          PREV_TAG="$(git tag --merged "$COMMIT_SHA" --list 'v*' --sort=-creatordate | grep -vxF "$TAG" | head -n1 || true)"
+
+          if [[ -n "$PREV_TAG" ]]; then
+            RANGE="${PREV_TAG}..${COMMIT_SHA}"
+          else
+            RANGE="$COMMIT_SHA"
+          fi
+
+          COUNT="$(git rev-list --count --no-merges "$RANGE")"
+          git log "$RANGE" --no-merges -n "$CHANGELOG_MAX_COMMITS" --pretty='- %s (%h)' > changelog.md
+
+          # Fallback: e.g. only merge commits in range
+          if [[ ! -s changelog.md ]]; then
+            git log -1 --pretty='- %s (%h)' "$COMMIT_SHA" > changelog.md
+          fi
+
+          if (( COUNT > CHANGELOG_MAX_COMMITS )); then
+            echo "- …and $((COUNT - CHANGELOG_MAX_COMMITS)) more commits" >> changelog.md
+          fi
+
+          echo "Previous tag: ${PREV_TAG:-none}"
+          echo "Commits in range: $COUNT"
+          cat changelog.md
+
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT"       >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
       # 2. Stage the files that go into the archives
@@ -201,8 +327,13 @@ jobs:
             exit 1
           fi
 
-          # Checksums for whatever survived
+          # Combined checksums for whatever survived
           sha256sum "${ok[@]}" > SHA256SUMS.txt
+
+          # Per-file checksums (<archive>.sha256)
+          for f in "${ok[@]}"; do
+            sha256sum "$f" > "${f}.sha256"
+          done
 
           {
             echo "assets=${ok[*]}"
@@ -210,68 +341,145 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
+      # 4b. Re-check every checksum right before upload
+      # ------------------------------------------------------------------
+      - name: Re-verify checksums before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+
+          echo "Checking SHA256SUMS.txt"
+          sha256sum -c --strict SHA256SUMS.txt
+
+          for sumfile in *.sha256; do
+            echo "Checking $sumfile"
+            sha256sum -c --strict "$sumfile"
+          done
+
+          # Every archive must be covered by both the combined and per-file sums
+          for archive in *.zip *.tar.gz *.7z; do
+            grep -qF -- "  $archive" SHA256SUMS.txt \
+              || { echo "::error::$archive missing from SHA256SUMS.txt"; exit 1; }
+            [[ -s "${archive}.sha256" ]] \
+              || { echo "::error::${archive}.sha256 missing"; exit 1; }
+          done
+
+          echo "All checksums verified"
+
+      # ------------------------------------------------------------------
       # 5. Create the release (name = VERSION from main.lua)
       # ------------------------------------------------------------------
       - name: Create GitHub release
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
+          IS_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          IS_DRAFT: ${{ inputs.draft || false }}
+          PREV_TAG: ${{ steps.changelog.outputs.prev_tag }}
           FAILED: ${{ steps.verify.outputs.failed }}
           COMMIT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
           REPO: ${{ github.repository }}
           SERVER: ${{ github.server_url }}
         run: |
           set -euo pipefail
 
           # Collect files that actually exist in dist/
-          mapfile -t FILES < <(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.7z' -o -name 'SHA256SUMS.txt' \) | sort)
+          mapfile -t FILES < <(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.7z' -o -name '*.sha256' -o -name 'SHA256SUMS.txt' \) | sort)
           if [[ ${#FILES[@]} -eq 0 ]]; then
             echo "::error::No files to upload"
             exit 1
           fi
 
-          COMMIT_MSG="$(git log -1 --pretty=%B "$COMMIT_SHA")"
           SHORT_SHA="${COMMIT_SHA:0:7}"
 
+          # ---- Decide tag / title / whether to replace an existing release ----
+          RELEASE_TAG="$TAG"
+          RELEASE_TITLE="$VERSION"
+          REPLACED=false
+
+          EXISTS=false
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            EXISTS=true
+          fi
+
+          if [[ "$IS_DRAFT" == "true" ]]; then
+            # Draft/test run: never delete a real release. If one exists,
+            # give the draft its own tag so nothing collides.
+            if [[ "$EXISTS" == "true" ]]; then
+              RELEASE_TAG="${TAG}-draft.${RUN_NUMBER}"
+              RELEASE_TITLE="${VERSION} (draft run ${RUN_NUMBER})"
+              echo "::warning::Release $TAG already exists; creating draft as $RELEASE_TAG and leaving the existing release alone"
+            fi
+          elif [[ "$EXISTS" == "true" ]]; then
+            # main.lua changed but VERSION didn't: replace so it points at the newest commit.
+            echo "Release $TAG already exists, replacing it"
+            gh release delete "$TAG" --cleanup-tag --yes
+            REPLACED=true
+          fi
+
+          # ---- Release notes ----
           {
             echo "## Version $VERSION"
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              echo
+              echo "> **Pre-release:** may be unstable."
+            fi
             echo
             echo "Commit: [\`$SHORT_SHA\`]($SERVER/$REPO/commit/$COMMIT_SHA)"
             echo
             echo "### Changes"
-            echo '```'
-            echo "$COMMIT_MSG"
-            echo '```'
+            if [[ -n "$PREV_TAG" ]]; then
+              echo "Since [\`$PREV_TAG\`]($SERVER/$REPO/releases/tag/$PREV_TAG) ([full diff]($SERVER/$REPO/compare/$PREV_TAG...$COMMIT_SHA)):"
+            else
+              echo "No previous tag found, showing recent history:"
+            fi
+            echo
+            cat changelog.md
             echo
             echo "### Downloads"
             for f in "${FILES[@]}"; do echo "- \`$(basename "$f")\`"; done
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS.txt\` (or the matching \`.sha256\` file)."
             if [[ "$FAILED" != "none" && -n "$FAILED" ]]; then
               echo
               echo "> Note: these formats failed to build and are not included: $FAILED"
             fi
           } > release_notes.md
 
-          # If this version already has a release (main.lua changed but VERSION
-          # didn't), replace it so it points at the newest commit.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, replacing it"
-            gh release delete "$TAG" --cleanup-tag --yes
+          # ---- Build gh flags ----
+          ARGS=(--title "$RELEASE_TITLE" --notes-file release_notes.md --target "$COMMIT_SHA")
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            ARGS+=(--prerelease)
+          elif [[ "$IS_DRAFT" != "true" ]]; then
+            ARGS+=(--latest)
           fi
+          if [[ "$IS_DRAFT" == "true" ]]; then
+            ARGS+=(--draft)
+          fi
+
+          echo "Creating release: tag=$RELEASE_TAG prerelease=$IS_PRERELEASE draft=$IS_DRAFT"
 
           # Retry a few times for transient API/network errors
           for attempt in 1 2 3; do
-            if gh release create "$TAG" "${FILES[@]}" \
-                 --title "$VERSION" \
-                 --notes-file release_notes.md \
-                 --target "$COMMIT_SHA" \
-                 --latest; then
+            if gh release create "$RELEASE_TAG" "${FILES[@]}" "${ARGS[@]}"; then
               echo "Release created on attempt $attempt"
+              {
+                echo "replaced=$REPLACED"
+                echo "release_tag=$RELEASE_TAG"
+              } >> "$GITHUB_OUTPUT"
+              if [[ "$REPLACED" == "true" ]]; then
+                echo "::notice::Replaced existing release $TAG (VERSION was not bumped)"
+              fi
               exit 0
             fi
             echo "::warning::Release attempt $attempt failed, retrying..."
-            gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+            gh release delete "$RELEASE_TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
             sleep $((attempt * 5))
           done
 
@@ -286,15 +494,32 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          IS_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          IS_DRAFT: ${{ inputs.draft || false }}
           ASSETS: ${{ steps.verify.outputs.assets }}
           FAILED: ${{ steps.verify.outputs.failed }}
+          PREV_TAG: ${{ steps.changelog.outputs.prev_tag }}
+          COUNT: ${{ steps.changelog.outputs.count }}
+          TAG_EXISTS: ${{ steps.guard.outputs.tag_exists }}
+          REPLACED: ${{ steps.release.outputs.replaced }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
         run: |
           {
             echo "## Release summary"
             echo
             echo "- **Version:** ${VERSION:-unknown}"
+            echo "- **Tag:** ${RELEASE_TAG:-n/a}"
+            echo "- **Type:** $([[ "${IS_PRERELEASE:-}" == "true" ]] && echo "pre-release" || echo "stable")$([[ "${IS_DRAFT:-}" == "true" ]] && echo " (draft)" || true)"
+            echo "- **Changelog:** ${COUNT:-0} commit(s) since ${PREV_TAG:-the beginning}"
             echo "- **Released:** ${ASSETS:-nothing}"
             echo "- **Failed/skipped:** ${FAILED:-n/a}"
+            if [[ "${REPLACED:-}" == "true" ]]; then
+              echo
+              echo "> :information_source: **Replaced existing release** for this version (VERSION was not bumped)."
+            elif [[ "${TAG_EXISTS:-}" == "true" && "${IS_DRAFT:-}" == "true" ]]; then
+              echo
+              echo "> :information_source: A release for this version already exists and was left untouched (draft mode)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ------------------------------------------------------------------
