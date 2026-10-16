@@ -23,7 +23,7 @@ concurrency:
 env:
   VERSION_FILE: main.lua
   # Only look for the VERSION line in the first N lines ("top of the file").
-  VERSION_SCAN_LINES: 22
+  VERSION_SCAN_LINES: 60
 
 jobs:
   release:
