@@ -308,3 +308,73 @@ jobs:
             echo "::warning::lsb_release not available, falling back to /etc/os-release"
             cat /etc/os-release
           }
+  steam-workshop:
+    needs: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Stage Workshop content
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf staging
+          mkdir -p staging/content
+
+          # Same idea as your release: tracked files only
+          git archive --format=tar HEAD | tar -x -C staging/content
+
+          # Not part of the mod
+          rm -rf staging/content/.github
+          rm -f  staging/content/README.md
+
+          # Read version for the change note
+          VERSION="$(head -n 60 main.lua | tr -d '\r' | grep -m1 -E '^[[:space:]]*local[[:space:]]+VERSION' | sed -E "s/.*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
+          MSG="$(git log -1 --pretty=%s "$COMMIT_SHA" | tr -d '"')"
+
+          cat > staging/workshop.vdf <<EOF
+          "workshopitem"
+          {
+            "appid"           "1167630"
+            "publishedfileid" "3814944669"
+            "contentfolder"   "/staging/content"
+            "previewfile"     "/staging/content/preview.jpg"
+            "changenote"      "v${VERSION}: ${MSG}"
+          }
+          EOF
+
+          echo "Staged contents:"
+          find staging/content -type f | sort
+          echo "workshop.vdf:"
+          cat staging/workshop.vdf
+
+      - name: Restore Steam login session
+        shell: bash
+        env:
+          STEAM_CONFIG_VDF: ${{ secrets.STEAM_CONFIG_VDF }}
+        run: |
+          set -euo pipefail
+          mkdir -p steamconfig
+          printf '%s' "$STEAM_CONFIG_VDF" | base64 -d > steamconfig/config.vdf
+          chmod -R a+rwX steamconfig
+
+      - name: Upload to Steam Workshop
+        shell: bash
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/staging:/staging" \
+            -v "$PWD/steamconfig:/root/Steam/config" \
+            -v "$PWD/steamconfig:/root/.local/share/Steam/config" \
+            -v "$PWD/steamconfig:/root/.steam/steam/config" \
+            steamcmd/steamcmd:latest \
+            +login "$STEAM_USERNAME" \
+            +workshop_build_item /staging/workshop.vdf \
+            +quit
