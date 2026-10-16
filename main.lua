@@ -17,7 +17,7 @@
 -- Accent colours are saved by position, so new ones only go at the end.
 -- Server setters clamp every value themselves, whatever the client sent.
 
-local VERSION = "28.6"
+local VERSION = "28.7"
 local REVISION = 1
 
 local floor, min, max, sqrt = math.floor, math.min, math.max, math.sqrt
@@ -203,7 +203,13 @@ end
 -- Changelog shown in the About tab, newest first. Keep each entry to 10 short lines.
 local CHANGELOG = {
 	{
-		version = "28.6", title = "Polish and bug fixes",
+		version = "28.7", title = "Polish and bug fixes",
+		notes = {
+			"Github: Support updates"
+		},
+	},
+	{
+		version = "28.6", title = "Cleanup",
 		notes = {
 			"Menu: new About tab (this one) holds the changelog; sidebar tightened.",
 			"Key binding: capture no longer stays armed after the menu closes.",
@@ -215,16 +221,6 @@ local CHANGELOG = {
 			"Controller: disabled buttons skip focus; tab switching moves focus.",
 			"Performance: shared lists only update on change, fewer allocations,",
 			"distant exhaust skipped past 80 m, one ground check per client tick.",
-		},
-	},
-	{
-		version = "28.5", title = "Cleanup",
-		notes = {
-			"Server setters are generated from small tables instead of copy-pasted.",
-			"Settings rows return clicks instead of callbacks (no per-frame closures).",
-			"Per-frame work trimmed (cached tab lists, no string building in T()).",
-			"Default accent colour (menu and HUD) is now Mint; saved accents are kept.",
-			"Flame colours are unchanged.",
 		},
 	},
 }
