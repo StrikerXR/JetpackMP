@@ -1,0 +1,310 @@
+name: Release on main.lua change
+
+# Runs on every push to main that touches main.lua.
+# Reads `local VERSION = "x.y"` from main.lua, names the release after it,
+# and publishes .zip (primary) plus .tar.gz and .7z (secondary).
+# Any archive that fails to build or fails verification is skipped;
+# the release still ships with whatever archives succeeded.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - main.lua
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VERSION_FILE: main.lua
+  # Only look for the VERSION line in the first N lines ("top of the file").
+  VERSION_SCAN_LINES: 60
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # 1. Read the version from main.lua
+      # ------------------------------------------------------------------
+      - name: Extract VERSION from main.lua
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$VERSION_FILE" ]]; then
+            echo "::error::$VERSION_FILE not found"
+            exit 1
+          fi
+
+          # Match: local VERSION = "28.5"  (single or double quotes, any spacing)
+          PATTERN='^[[:space:]]*local[[:space:]]+VERSION[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+
+          LINE="$(head -n "$VERSION_SCAN_LINES" "$VERSION_FILE" | tr -d '\r' | grep -m1 -E "$PATTERN" || true)"
+
+          # Fallback: search the whole file if not near the top
+          if [[ -z "$LINE" ]]; then
+            echo "::warning::VERSION not found in first $VERSION_SCAN_LINES lines, scanning whole file"
+            LINE="$(tr -d '\r' < "$VERSION_FILE" | grep -m1 -E "$PATTERN" || true)"
+          fi
+
+          if [[ -z "$LINE" ]]; then
+            echo "::error::Could not find a line like: local VERSION = \"28.5\" in $VERSION_FILE"
+            exit 1
+          fi
+
+          VERSION="$(printf '%s' "$LINE" | sed -E "s/.*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
+
+          if [[ ! "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+            echo "::error::Extracted version '$VERSION' contains unsupported characters"
+            exit 1
+          fi
+
+          echo "Found: $LINE"
+          echo "Version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 2. Stage the files that go into the archives
+      # ------------------------------------------------------------------
+      - name: Stage release files
+        id: stage
+        shell: bash
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG="${REPO_NAME}-${VERSION}"
+
+          rm -rf staging dist
+          mkdir -p "staging/$PKG" dist
+
+          # Tracked files only (no .git, no untracked junk)
+          git archive --format=tar HEAD | tar -x -C "staging/$PKG"
+
+          # Don't ship CI config inside the mod package
+          rm -rf "staging/$PKG/.github"
+
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "Staged contents:"
+          (cd staging && find "$PKG" -type f | sort)
+
+      # ------------------------------------------------------------------
+      # 3. Build archives. Each is independent; failures don't stop the job.
+      # ------------------------------------------------------------------
+      - name: Build .zip (primary)
+        id: zip
+        continue-on-error: true
+        shell: bash
+        env:
+          PKG: ${{ steps.stage.outputs.pkg }}
+        run: |
+          set -euo pipefail
+          if ! command -v zip >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zip
+          fi
+          cd staging
+          zip -r -9 -X "../dist/${PKG}.zip" "$PKG"
+
+      - name: Build .tar.gz (secondary)
+        id: tar
+        continue-on-error: true
+        shell: bash
+        env:
+          PKG: ${{ steps.stage.outputs.pkg }}
+        run: |
+          set -euo pipefail
+          tar -C staging -czf "dist/${PKG}.tar.gz" "$PKG"
+
+      - name: Build .7z (secondary)
+        id: sevenzip
+        continue-on-error: true
+        shell: bash
+        env:
+          PKG: ${{ steps.stage.outputs.pkg }}
+        run: |
+          set -euo pipefail
+
+          SEVENZ=""
+          for c in 7z 7zz 7za; do
+            if command -v "$c" >/dev/null; then SEVENZ="$c"; break; fi
+          done
+          if [[ -z "$SEVENZ" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq p7zip-full
+            SEVENZ="7z"
+          fi
+
+          cd staging
+          "$SEVENZ" a -t7z -mx=9 "../dist/${PKG}.7z" "$PKG"
+
+      # ------------------------------------------------------------------
+      # 4. Verify each archive; discard any that are missing or corrupt
+      # ------------------------------------------------------------------
+      - name: Verify archives and collect assets
+        id: verify
+        if: always()
+        shell: bash
+        env:
+          PKG: ${{ steps.stage.outputs.pkg }}
+        run: |
+          set -uo pipefail
+          cd dist 2>/dev/null || { echo "::error::dist/ missing"; exit 1; }
+
+          ok=()
+          failed=()
+
+          check() {
+            local file="$1" label="$2"; shift 2
+            if [[ -s "$file" ]] && "$@" >/dev/null 2>&1; then
+              echo "OK:     $label ($file)"
+              ok+=("$file")
+            else
+              echo "::warning::$label failed or is invalid, it will not be released"
+              rm -f "$file"
+              failed+=("$label")
+            fi
+          }
+
+          SEVENZ=""
+          for c in 7z 7zz 7za; do
+            if command -v "$c" >/dev/null; then SEVENZ="$c"; break; fi
+          done
+
+          check "${PKG}.zip"    "zip"    unzip -tq "${PKG}.zip"
+          check "${PKG}.tar.gz" "tar.gz" tar -tzf "${PKG}.tar.gz"
+          if [[ -n "$SEVENZ" ]]; then
+            check "${PKG}.7z"   "7z"     "$SEVENZ" t "${PKG}.7z"
+          else
+            echo "::warning::No 7z binary available, 7z skipped"
+            rm -f "${PKG}.7z"
+            failed+=("7z")
+          fi
+
+          if [[ ${#ok[@]} -eq 0 ]]; then
+            echo "::error::All archive formats failed. Nothing to release."
+            exit 1
+          fi
+
+          # Checksums for whatever survived
+          sha256sum "${ok[@]}" > SHA256SUMS.txt
+
+          {
+            echo "assets=${ok[*]}"
+            echo "failed=${failed[*]:-none}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 5. Create the release (name = VERSION from main.lua)
+      # ------------------------------------------------------------------
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          FAILED: ${{ steps.verify.outputs.failed }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          # Collect files that actually exist in dist/
+          mapfile -t FILES < <(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.7z' -o -name 'SHA256SUMS.txt' \) | sort)
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "::error::No files to upload"
+            exit 1
+          fi
+
+          COMMIT_MSG="$(git log -1 --pretty=%B "$COMMIT_SHA")"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          {
+            echo "## Version $VERSION"
+            echo
+            echo "Commit: [\`$SHORT_SHA\`]($SERVER/$REPO/commit/$COMMIT_SHA)"
+            echo
+            echo "### Changes"
+            echo '```'
+            echo "$COMMIT_MSG"
+            echo '```'
+            echo
+            echo "### Downloads"
+            for f in "${FILES[@]}"; do echo "- \`$(basename "$f")\`"; done
+            if [[ "$FAILED" != "none" && -n "$FAILED" ]]; then
+              echo
+              echo "> Note: these formats failed to build and are not included: $FAILED"
+            fi
+          } > release_notes.md
+
+          # If this version already has a release (main.lua changed but VERSION
+          # didn't), replace it so it points at the newest commit.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, replacing it"
+            gh release delete "$TAG" --cleanup-tag --yes
+          fi
+
+          # Retry a few times for transient API/network errors
+          for attempt in 1 2 3; do
+            if gh release create "$TAG" "${FILES[@]}" \
+                 --title "$VERSION" \
+                 --notes-file release_notes.md \
+                 --target "$COMMIT_SHA" \
+                 --latest; then
+              echo "Release created on attempt $attempt"
+              exit 0
+            fi
+            echo "::warning::Release attempt $attempt failed, retrying..."
+            gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+            sleep $((attempt * 5))
+          done
+
+          echo "::error::Failed to create release after 3 attempts"
+          exit 1
+
+      # ------------------------------------------------------------------
+      # 6. Summary
+      # ------------------------------------------------------------------
+      - name: Job summary
+        if: always()
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ASSETS: ${{ steps.verify.outputs.assets }}
+          FAILED: ${{ steps.verify.outputs.failed }}
+        run: |
+          {
+            echo "## Release summary"
+            echo
+            echo "- **Version:** ${VERSION:-unknown}"
+            echo "- **Released:** ${ASSETS:-nothing}"
+            echo "- **Failed/skipped:** ${FAILED:-n/a}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 7. Always runs last, even if earlier steps failed
+      # ------------------------------------------------------------------
+      - name: Runner OS info (lsb_release -a)
+        if: always()
+        shell: bash
+        run: |
+          lsb_release -a || {
+            echo "::warning::lsb_release not available, falling back to /etc/os-release"
+            cat /etc/os-release
+          }
