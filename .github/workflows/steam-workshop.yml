@@ -1,0 +1,96 @@
+name: Publish to Steam Workshop
+
+# Runs after "Release on main.lua change" succeeds.
+# Can also be run by hand from the Actions tab to test the upload alone.
+on:
+  workflow_run:
+    workflows: ["Release on main.lua change"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steam-workshop
+  cancel-in-progress: false
+
+jobs:
+  steam-workshop:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Stage Workshop content
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf staging
+          mkdir -p staging/content
+
+          # Tracked files only
+          git archive --format=tar HEAD | tar -x -C staging/content
+
+          # Not part of the mod
+          rm -rf staging/content/.github
+          rm -f  staging/content/README.md
+
+          # Version and commit message for the change note
+          VERSION="$(head -n 60 main.lua | tr -d '\r' | grep -m1 -E '^[[:space:]]*local[[:space:]]+VERSION' | sed -E "s/.*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
+          MSG="$(git log -1 --pretty=%s | tr -d '"')"
+
+          cat > staging/workshop.vdf <<EOF
+          "workshopitem"
+          {
+            "appid"           "1167630"
+            "publishedfileid" "3814944669"
+            "contentfolder"   "/staging/content"
+            "previewfile"     "/staging/content/preview.jpg"
+            "changenote"      "v${VERSION}: ${MSG}"
+          }
+          EOF
+
+          echo "Staged contents:"
+          find staging/content -type f | sort
+          echo "workshop.vdf:"
+          cat staging/workshop.vdf
+
+      - name: Restore Steam login session
+        shell: bash
+        env:
+          STEAM_CONFIG_VDF: ${{ secrets.STEAM_CONFIG_VDF }}
+        run: |
+          set -euo pipefail
+          mkdir -p steamconfig
+          printf '%s' "$STEAM_CONFIG_VDF" | base64 -d > steamconfig/config.vdf
+          chmod -R a+rwX steamconfig
+
+      - name: Upload to Steam Workshop
+        shell: bash
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network host \
+            -e STEAM_USERNAME \
+            -v "$PWD/staging:/staging" \
+            -v "$PWD/steamconfig/config.vdf:/tmp/config.vdf:ro" \
+            --entrypoint bash \
+            steamcmd/steamcmd:latest \
+            -c '
+              set -e
+              # 1. Let SteamCMD finish updating itself first
+              steamcmd +quit
+              # 2. Only then drop in the saved login
+              mkdir -p /root/.local/share/Steam/config
+              cp /tmp/config.vdf /root/.local/share/Steam/config/config.vdf
+              # 3. Upload
+              steamcmd +login "$STEAM_USERNAME" +workshop_build_item /staging/workshop.vdf +quit
+            '
